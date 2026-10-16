@@ -1,0 +1,7 @@
+fastapi==0.135.1
+uvicorn==0.41.0
+ldap3==2.9.1
+httpx==0.28.1
+cryptography==46.0.5
+scim2-models==0.12.2
+scim2-filter-parser==0.7.0

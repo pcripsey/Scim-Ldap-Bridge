@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+bridge-backup/
+.env
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/

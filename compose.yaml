@@ -1,0 +1,24 @@
+services:
+  bridge:
+    build: .
+    image: scim-ldap-bridge:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-8000}:8000"
+    environment:
+      BRIDGE_ADMIN_TOKEN: ${BRIDGE_ADMIN_TOKEN:?Set a random BRIDGE_ADMIN_TOKEN of at least 24 characters}
+      BRIDGE_SCIM_TOKEN: ${BRIDGE_SCIM_TOKEN:-}
+      BRIDGE_DATA_DIR: /data
+    volumes:
+      - bridge-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 120s
+
+volumes:
+  bridge-data:
