@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -29,6 +30,46 @@ class ApiTests(unittest.TestCase):
     def test_requires_authentication(self):
         self.assertEqual(self.client.get("/api/status").status_code, 401)
         self.assertEqual(self.client.get("/healthz").status_code, 200)
+
+    def test_console_and_assets_are_served_with_security_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            static = Path(directory)
+            (static / "assets").mkdir()
+            (static / "index.html").write_text('<html><script src="/assets/console.js"></script></html>')
+            (static / "assets" / "console.js").write_text('console.log("console loaded");')
+            with patch("bridge.app.STATIC", static):
+                with TestClient(create_app(self.directory.name, ADMIN, SCIM)) as client:
+                    response = client.get("/")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("/assets/console.js", response.text)
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
+                    self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+                    asset = client.get("/assets/console.js")
+                    self.assertEqual(asset.status_code, 200)
+                    self.assertIn("console loaded", asset.text)
+                    self.assertEqual(client.get("/api/settings").status_code, 401)
+
+    def test_unbuilt_console_has_explicit_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("bridge.app.STATIC", Path(directory)):
+                response = self.client.get("/")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("npm", response.json()["detail"])
+
+    def test_settings_edits_preserve_or_explicitly_clear_secrets(self):
+        self.client.put("/api/settings", headers=HEADERS,
+                        json={"scim_token": "saved-token", "ldap_password": "saved-password"})
+        response = self.client.put("/api/settings", headers=HEADERS,
+                                   json={"direction": "ldap_to_scim", "interval_seconds": 600})
+        self.assertEqual(response.status_code, 200)
+        settings = self.client.app.state.store.settings()
+        self.assertEqual(settings.scim_token, "saved-token")
+        self.assertEqual(settings.ldap_password, "saved-password")
+        self.client.put("/api/settings", headers=HEADERS, json={"scim_token": ""})
+        settings = self.client.get("/api/settings", headers=HEADERS).json()
+        self.assertFalse(settings["scim_token_configured"])
+        self.assertTrue(settings["ldap_password_configured"])
 
     def test_defaults_are_safe(self):
         response = self.client.get("/api/settings", headers=HEADERS).json()
@@ -63,6 +104,15 @@ class ApiTests(unittest.TestCase):
         response = self.client.put("/api/settings", headers=HEADERS,
                                    json={"ldap_url": "ldap://directory.example.org", "ldap_start_tls": False})
         self.assertEqual(response.status_code, 400)
+
+    def test_allows_unencrypted_ldap_with_explicit_opt_in(self):
+        response = self.client.put("/api/settings", headers=HEADERS,
+                                   json={"ldap_url": "ldap://directory.example.org:389", "ldap_start_tls": False,
+                                         "ldap_allow_insecure": True})
+        self.assertEqual(response.status_code, 200)
+        saved = self.client.get("/api/settings", headers=HEADERS).json()
+        self.assertTrue(saved["ldap_allow_insecure"])
+        self.assertFalse(saved["ldap_start_tls"])
 
     def test_cannot_schedule_incomplete_connectors(self):
         self.assertEqual(self.client.put("/api/settings", headers=HEADERS, json={"enabled": True}).status_code, 400)

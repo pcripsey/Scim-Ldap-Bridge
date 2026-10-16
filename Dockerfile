@@ -1,3 +1,10 @@
+FROM node:22-alpine AS console
+WORKDIR /web
+COPY web/package*.json ./
+RUN npm ci
+COPY web ./
+RUN npm run build
+
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -13,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && chown bridge:bridge /data \
     && chmod 700 /data
 COPY bridge ./bridge
+COPY --from=console /web/dist ./web/dist
 
 USER bridge
 VOLUME ["/data"]

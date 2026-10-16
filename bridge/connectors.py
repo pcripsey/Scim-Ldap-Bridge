@@ -114,12 +114,15 @@ class LdapClient:
     def __enter__(self):
         parsed = urlparse(self.settings.ldap_url)
         secure = parsed.scheme == "ldaps"
+        start_tls = not secure and self.settings.ldap_start_tls
+        if not secure and not start_tls and not self.settings.ldap_allow_insecure:
+            raise ValueError("Unencrypted LDAP is not allowed by the current configuration.")
         server = Server(parsed.hostname, port=parsed.port or (636 if secure else 389), use_ssl=secure,
                         tls=Tls(validate=ssl.CERT_REQUIRED), connect_timeout=10)
         self.connection = Connection(server, user=self.settings.ldap_bind_dn,
                                      password=self.settings.ldap_password, raise_exceptions=True,
                                      receive_timeout=30,
-                                     auto_bind=AUTO_BIND_NO_TLS if secure else AUTO_BIND_TLS_BEFORE_BIND)
+                                     auto_bind=AUTO_BIND_TLS_BEFORE_BIND if start_tls else AUTO_BIND_NO_TLS)
         return self
 
     def __exit__(self, *args):

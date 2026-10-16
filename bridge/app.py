@@ -298,7 +298,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     def console():
         if not (STATIC / "index.html").exists():
             raise HTTPException(503, "Console assets are not built. Run npm ci && npm run build in web/.")
-        return FileResponse(STATIC / "index.html")
+        return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-store"})
 
     return app
 

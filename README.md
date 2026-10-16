@@ -19,8 +19,78 @@ restart. An optional, distinct `BRIDGE_SCIM_TOKEN` enables inbound provisioning.
 Both tokens must be at least 24 characters. Do not commit tokens to source control.
 The port binds to localhost by default; use a TLS reverse proxy for remote access.
 
-The current container exposes the management API. Web console assets have not yet
-been implemented; the root URL reports that the console is unavailable.
+Open **http://localhost:8000/** and sign in with your administrator token. The
+Docker build compiles and bundles the React console; no separate web server or
+Node.js runtime is required in the final container.
+
+PowerShell alternative (generate a token once, then keep it securely for restarts):
+
+```powershell
+$env:BRIDGE_ADMIN_TOKEN = python -c "import secrets; print(secrets.token_hex(32))"
+docker compose up --build -d
+```
+
+## Web Configuration Console
+
+The responsive React/TypeScript console includes:
+
+- **Overview:** connector configuration state, inventory counts, linked identities,
+  synchronization status, recent runs, and events.
+- **Connections:** SCIM URL/token and LDAP URL, bind DN/password, base DN, and StartTLS.
+  Test saved connectors before syncing. Saved credentials are never returned;
+  explicitly choose to replace or clear them, otherwise they remain unchanged.
+- **Synchronization:** direction, conflict policy, dry-run/live mode, automatic
+  scheduling, interval (30-86,400 seconds), and manual runs.
+- **Inventory:** paginated, source/type-filtered cached resources, presence state,
+  and a read-only decrypted attribute inspector.
+- **Activity:** recent runs, paginated operation history, and recent events.
+- **System:** inbound SCIM availability, deployment settings, and backup guidance.
+
+The admin token is held only in memory, never in local/session storage or URLs.
+Reloading or signing out clears the session. Use HTTPS for remote access.
+Status refreshes every five seconds; inventory and operation lists have explicit
+refresh buttons. Poll failures are visible and disable manual sync until recovery.
+Draft configuration survives navigation between console sections and warns before
+closing the page. Save or discard edits before testing connections or starting a
+manual run. Saving is blocked during a running directory operation; server
+validation and authorization remain authoritative.
+
+Enabling live writes, changing connector identity (which resets baselines and
+inventory), or clearing credentials requires confirmation. Live manual runs also
+require confirmation. The schedule always uses **persisted** settings, so an
+already-enabled schedule continues using the previous policy until edits are saved.
+Start with dry runs, review the operation plan, then intentionally enable live mode.
+
+The console manages every setting currently exposed by the bridge, not the host
+or external directories. Deployment tokens, TLS trust, data paths, ports, and
+container settings stay server-managed. Rotate environment tokens by updating
+the deployment and restarting. Inventory is read-only; groups, deletion,
+password writes, custom mappings, and interactive conflict resolution are not
+implemented. Resolve conflicts in the authoritative directories and rerun sync.
+
+### Run Locally (PowerShell)
+
+Requires Python with the project dependencies and Node.js 22+ for building.
+Run from the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Push-Location web
+npm ci
+npm run build
+Pop-Location
+$env:BRIDGE_ADMIN_TOKEN = .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_hex(32))"
+.\.venv\Scripts\python.exe -m uvicorn bridge.app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Open http://127.0.0.1:8000/. Supply the value of `$env:BRIDGE_ADMIN_TOKEN` at sign-in
+(keep it in a secret manager to reuse after restarts). Do not run the app file
+directly; use the module-based Uvicorn command above. For hot-reload development,
+keep the backend running and run `npm run dev` in `web` in another terminal.
+Open the Vite URL (normally http://127.0.0.1:5173); it proxies management requests
+to the backend on port 8000. Production serves UI and API from the same origin,
+without CORS or external/CDN assets. Rebuild the console after frontend changes.
 
 ## Database
 
@@ -117,7 +187,10 @@ provisioning, and complete schema-driven synchronization are not yet implemented
 Schema-extension helpers are work in progress. The database can preserve additional
 attributes, but that alone does not make the connectors synchronize them.
 
-LDAP requires certificate-verified LDAPS or StartTLS. Remote SCIM supports HTTP or
+LDAP uses certificate-verified LDAPS (`ldaps://`, port 636, implicit TLS) or StartTLS
+on `ldap://` (port 389). Unencrypted `ldap://` without StartTLS is rejected unless
+`ldap_allow_insecure` is explicitly enabled; it sends the bind password and directory
+data in clear text, so use it only on a trusted, isolated network. Remote SCIM supports HTTP or
 HTTPS; use HTTPS outside an isolated development environment. Usernames are the
 current matching key. Treat renames and missing linked users as manual conflicts.
 
@@ -130,3 +203,16 @@ python -m venv .venv
 ```
 
 The focused database tests are in `tests/test_store.py` and `tests/test_service.py`.
+
+Console browser tests use isolated, mocked management APIs (no live directory
+writes), and exercise auth, credential preservation/clearing, configuration saves,
+confirmations, tests, sync triggers, errors, polling, inventory, and mobile layout:
+
+```powershell
+Push-Location web
+npm ci
+npm run build
+npx playwright install chromium
+npm test
+Pop-Location
+```
