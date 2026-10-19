@@ -3,6 +3,7 @@ export interface Settings {
   ldap_url: string;
   ldap_bind_dn: string;
   ldap_base_dn: string;
+  attribute_mappings: AttributeMapping[];
   ldap_start_tls: boolean;
   ldap_allow_insecure: boolean;
   direction: 'bidirectional' | 'scim_to_ldap' | 'ldap_to_scim';
@@ -12,6 +13,26 @@ export interface Settings {
   dry_run: boolean;
   scim_token_configured: boolean;
   ldap_password_configured: boolean;
+}
+
+export interface AttributeMapping {
+  scim_path: string;
+  ldap_attribute: string;
+  direction: 'both' | 'scim_to_ldap' | 'ldap_to_scim';
+}
+
+export interface AttributeDiscovery {
+  schemas: unknown[];
+  resource_types: unknown[];
+  attributes: { name: string; type?: string; multi_valued?: boolean | null; samples: string[] }[];
+  users: number;
+}
+
+export interface MappingValidation {
+  valid: boolean;
+  errors: { scim_path?: string; ldap_attribute?: string; message: string }[];
+  scim_attributes: number;
+  ldap_attributes: number;
 }
 
 export interface Run {

@@ -207,13 +207,33 @@ curl -X PUT http://localhost:8000/api/settings \
 
 ## Current Compatibility
 
-The running synchronization path currently maps `userName`, given name, family name,
-display name, and primary email to LDAP `inetOrgPerson` attributes. Inbound SCIM
-Users list/read/create/replace/patch operations are available at `/scim/v2`; inbound
-writes are blocked during dry runs. Deletion, groups, password writes, lifecycle
-provisioning, and complete schema-driven synchronization are not yet implemented.
-Schema-extension helpers are work in progress. The database can preserve additional
-attributes, but that alone does not make the connectors synchronize them.
+The inbound SCIM 2.0 User service exposes `/ServiceProviderConfig`, `/Schemas`,
+`/ResourceTypes`, and User list/read/create/replace/patch endpoints under `/scim/v2`.
+It supports SCIM filter expressions provided by the schema filter library, with
+pagination capped at 1,000 results per page. User responses include `meta.resourceType`
+and `meta.location`. Inbound writes are blocked during dry runs. The advertised feature
+set intentionally excludes bulk, sorting, ETags, and password changes.
+
+The console's **Attribute mapping** section can discover SCIM schemas/resource types,
+attribute type/multiplicity metadata when the SCIM schema provides it, and LDAP
+attribute names and samples (LDAP type/multiplicity is reported as unavailable).
+Sensitive-looking attributes are excluded. Map SCIM paths to LDAP attributes with
+per-rule directions, validate mappings against both connected sources, inspect a
+sample comparison, and save the mapping with the rest of the encrypted settings.
+Defaults map `userName`
+to `uid`, names to `givenName`/`sn`, `displayName` to `displayName`, and primary email
+to `mail`. SCIM paths are simple dotted paths, with extension attributes addressable
+by their full extension URN and attribute name. Mapping values are copied as-is; this
+is not a transformation language or a general-purpose schema/mapping engine.
+
+This is not yet a fully SCIM-compliant or Entra-validated connector. Only User is
+advertised as a resource type. Group provisioning, deactivation, deletion, password
+operations, configurable attribute transforms/defaults, full multivalue mapping, and
+arbitrary custom schema discovery/provisioning are not implemented. PATCH supports
+only `name`, `name.givenName`, `name.familyName`, `displayName`, and `emails` paths,
+not every writable User attribute or every SCIM path/value combination. LDAP writes still use the
+`inetOrgPerson` object classes and require a family name. Validate actual Entra
+provisioning behavior in a test tenant before production use.
 
 LDAP uses certificate-verified LDAPS (`ldaps://`, port 636, implicit TLS) or StartTLS
 on `ldap://` (port 389). Unencrypted `ldap://` without StartTLS is rejected unless
@@ -221,6 +241,12 @@ on `ldap://` (port 389). Unencrypted `ldap://` without StartTLS is rejected unle
 data in clear text, so use it only on a trusted, isolated network. Remote SCIM supports HTTP or
 HTTPS; use HTTPS outside an isolated development environment. Usernames are the
 current matching key. Treat renames and missing linked users as manual conflicts.
+
+Authenticated administrator endpoints `POST /api/discovery/scim` and
+`POST /api/discovery/ldap` read saved connector settings and return schemas (SCIM),
+resource types, attribute names, and up to three sample values per attribute. Use
+the discovery buttons only with trusted directories; returned sample values may
+contain personal data.
 
 ## Development Checks
 

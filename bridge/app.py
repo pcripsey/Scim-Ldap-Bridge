@@ -1,7 +1,6 @@
 import base64
 import hmac
 import os
-import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from pydantic import ValidationError
 
 from bridge.config import Settings
 from bridge.connectors import LdapClient, ScimClient, from_scim, scim_document
+from bridge.schema import Catalog, ENTERPRISE_SCHEMA, USER_SCHEMA
 from bridge.service import BusyError, SyncService
 from bridge.store import Store
 
@@ -26,8 +26,13 @@ def opaque_id(username):
     return base64.urlsafe_b64encode(username.encode()).decode().rstrip("=")
 
 
-def resource(user):
-    return {**scim_document(user), "id": opaque_id(user["userName"])}
+def resource(user, mappings=None, base_url=""):
+    identifier = opaque_id(user["userName"])
+    location = f"{base_url.rstrip('/')}/scim/v2/Users/{identifier}"
+    metadata = dict((user.get("_raw") or {}).get("meta") or {})
+    metadata.update({"resourceType": "User", "location": location})
+    return {**scim_document(user, user.get("_raw"), mappings), "id": identifier,
+            "meta": metadata}
 
 
 def create_app(data_dir=None, admin_token=None, scim_token=None):
@@ -48,6 +53,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         app.state.store.close()
 
     app = FastAPI(title="SCIM LDAP Bridge", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    catalog = Catalog()
 
     def authenticate(request, expected):
         supplied = request.headers.get("authorization", "")
@@ -76,6 +82,9 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     @app.middleware("http")
     async def security_headers(request, call_next):
         response = await call_next(request)
+        if (request.url.path.startswith("/scim/")
+                and response.headers.get("content-type", "").startswith("application/json")):
+            response.headers["Content-Type"] = "application/scim+json"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -169,6 +178,45 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         except Exception as error:
             raise HTTPException(502, f"Connection failed ({type(error).__name__}). Check credentials, TLS, endpoint, and read permissions.") from None
 
+    @app.post("/api/discovery/{connector}", dependencies=[Depends(admin)])
+    def discover_attributes(connector: str):
+        if connector not in ("scim", "ldap"):
+            raise HTTPException(404, "Unknown connector.")
+        try:
+            with (ScimClient if connector == "scim" else LdapClient)(app.state.store.settings()) as client:
+                result = client.discovery()
+            return result
+        except Exception as error:
+            raise HTTPException(502, f"Attribute discovery failed ({type(error).__name__}). Check credentials, TLS, endpoint, and read permissions.") from None
+
+    @app.post("/api/mappings/validate", dependencies=[Depends(admin)])
+    def validate_mappings(payload: dict = Body(...)):
+        try:
+            settings = Settings.model_validate({
+                **app.state.store.settings().model_dump(),
+                "attribute_mappings": payload.get("attribute_mappings"),
+            })
+        except ValidationError as error:
+            messages = [item["msg"] for item in error.errors(include_input=False, include_context=False)]
+            raise HTTPException(400, "; ".join(messages)) from None
+        try:
+            with ScimClient(settings) as scim_client:
+                scim = scim_client.discovery()
+            with LdapClient(settings) as ldap_client:
+                ldap = ldap_client.discovery()
+        except Exception as error:
+            raise HTTPException(502, f"Mapping validation could not inspect both connectors ({type(error).__name__}).") from None
+        scim_names = {item["name"].casefold() for item in scim["attributes"]}
+        ldap_names = {item["name"].casefold() for item in ldap["attributes"]}
+        errors = []
+        for mapping in settings.attribute_mappings:
+            if mapping.scim_path.casefold() not in scim_names:
+                errors.append({"scim_path": mapping.scim_path, "message": "Path was not discovered in the SCIM schema or sample resources."})
+            if mapping.ldap_attribute.casefold() not in ldap_names:
+                errors.append({"ldap_attribute": mapping.ldap_attribute, "message": "Attribute was not found in the LDAP search base."})
+        return {"valid": not errors, "errors": errors, "scim_attributes": len(scim_names),
+                "ldap_attributes": len(ldap_names)}
+
     def directory_operation(callback, write=False):
         service, store = app.state.service, app.state.store
         if not service.lock.acquire(blocking=False):
@@ -202,8 +250,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         if "active" in document or "password" in document or "groups" in document:
             raise HTTPException(400, "Account status, passwords, and group provisioning are not supported by this mapping.")
         try:
-            user = from_scim(document)
-        except (AttributeError, TypeError, KeyError):
+            user = from_scim(document, app.state.store.settings().attribute_mappings)
+        except (AttributeError, TypeError, KeyError, ValueError):
             raise HTTPException(400, "Invalid SCIM attribute types.") from None
         if not user["familyName"]:
             raise HTTPException(400, "name.familyName is required by the inetOrgPerson schema.")
@@ -213,43 +261,80 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     def provider_config():
         return {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
                 "patch": {"supported": True}, "bulk": {"supported": False, "maxOperations": 0, "maxPayloadSize": 0},
-                "filter": {"supported": True, "maxResults": 10000}, "changePassword": {"supported": False},
+                "filter": {"supported": True, "maxResults": 1000}, "changePassword": {"supported": False},
                 "sort": {"supported": False}, "etag": {"supported": False},
                 "authenticationSchemes": [{"type": "oauthbearertoken", "name": "Bearer token", "description": "Static provisioning token"}]}
 
-    @app.get("/scim/v2/Users", dependencies=[Depends(provisioning)])
-    def list_users(startIndex: int = Query(1, ge=1), count: int = Query(100, ge=0, le=1000), filter: str | None = None):
-        match = re.fullmatch(r'\s*userName\s+eq\s+"([^"\\]*)"\s*', filter, re.IGNORECASE) if filter else None
-        if filter and not match:
-            raise HTTPException(400, 'Only userName eq "value" filters are supported.')
+    @app.get("/scim/v2/Schemas", dependencies=[Depends(provisioning)])
+    def list_schemas():
+        supported = [schema for schema in catalog.schemas if schema.id in (USER_SCHEMA, ENTERPRISE_SCHEMA)]
+        schemas = [schema.model_dump(mode="json", by_alias=True, exclude_none=True) for schema in supported]
+        return {"schemas": [SCIM_LIST], "totalResults": len(schemas), "Resources": schemas}
 
+    @app.get("/scim/v2/Schemas/{schema_id:path}", dependencies=[Depends(provisioning)])
+    def get_schema(schema_id: str):
+        schema = next((item for item in catalog.schemas
+                       if item.id in (USER_SCHEMA, ENTERPRISE_SCHEMA) and item.id == schema_id), None)
+        if schema is None:
+            raise HTTPException(404, "Schema not found.")
+        return schema.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    @app.get("/scim/v2/ResourceTypes", dependencies=[Depends(provisioning)])
+    def list_resource_types():
+        resources = [
+            {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:ResourceType"], "id": "User",
+             "name": "User", "endpoint": "/Users", "description": "User account",
+             "schema": USER_SCHEMA, "schemaExtensions": [{"schema": ENTERPRISE_SCHEMA, "required": False}]},
+        ]
+        return {"schemas": [SCIM_LIST], "totalResults": len(resources), "Resources": resources}
+
+    @app.get("/scim/v2/ResourceTypes/{resource_type}", dependencies=[Depends(provisioning)])
+    def get_resource_type(resource_type: str):
+        if resource_type.casefold() != "user":
+            raise HTTPException(404, "Resource type not found.")
+        return list_resource_types()["Resources"][0]
+
+    @app.get("/scim/v2/Users", dependencies=[Depends(provisioning)])
+    def list_users(request: Request, startIndex: int = Query(1, ge=1), count: int = Query(100, ge=0, le=1000),
+                   filter: str | None = None):
         def read(client, users):
             selected = sorted(users.values(), key=lambda item: item["userName"])
-            if match:
-                selected = [user for user in selected if user["userName"].casefold() == match[1].casefold()]
+            mappings = app.state.store.settings().attribute_mappings
+            if filter:
+                try:
+                    selected = [user for user in selected
+                                if catalog.matches("Users", resource(user, mappings,
+                                                                     str(request.base_url).rstrip("/")), filter)]
+                except (ValueError, TypeError, KeyError):
+                    raise HTTPException(400, "Invalid or unsupported SCIM filter.") from None
             page = selected[startIndex - 1:startIndex - 1 + count]
             return {"schemas": [SCIM_LIST], "totalResults": len(selected), "startIndex": startIndex,
-                    "itemsPerPage": len(page), "Resources": [resource(user) for user in page]}
+                    "itemsPerPage": len(page), "Resources": [
+                        resource(user, mappings, str(request.base_url).rstrip("/")) for user in page]}
         return directory_operation(read)
 
     @app.get("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])
-    def get_user(identifier: str):
-        return directory_operation(lambda client, users: resource(find_user(users, identifier)))
+    def get_user(identifier: str, request: Request):
+        mappings = app.state.store.settings().attribute_mappings
+        return directory_operation(lambda client, users: resource(
+            find_user(users, identifier), mappings, str(request.base_url).rstrip("/")))
 
     @app.post("/scim/v2/Users", status_code=201, dependencies=[Depends(provisioning)])
-    def create_user(payload: dict = Body(...)):
+    def create_user(request: Request, payload: dict = Body(...)):
         user = validate_user(payload)
 
         def create(client, users):
             if any(name.casefold() == user["userName"].casefold() for name in users):
                 raise HTTPException(409, "userName already exists.")
             client.write(user)
-            return JSONResponse(resource(user), status_code=201, media_type="application/scim+json",
-                                headers={"Location": f"/scim/v2/Users/{opaque_id(user['userName'])}"})
+            created = resource(user, app.state.store.settings().attribute_mappings,
+                               str(request.base_url).rstrip("/"))
+            return JSONResponse(created, status_code=201, media_type="application/scim+json",
+                                headers={"Location": created["meta"]["location"]})
         return directory_operation(create, write=True)
 
     @app.put("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])
-    def replace_user(identifier: str, payload: dict = Body(...)):
+    def replace_user(identifier: str, request: Request, payload: dict = Body(...)):
         user = validate_user(payload)
 
         def replace(client, users):
@@ -257,18 +342,20 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             if user["userName"] != existing["userName"]:
                 raise HTTPException(400, "userName is immutable in this mapping.")
             client.write(user, existing)
-            return resource(user)
+            return resource(user, app.state.store.settings().attribute_mappings,
+                            str(request.base_url).rstrip("/"))
         return directory_operation(replace, write=True)
 
     @app.patch("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])
-    def patch_user(identifier: str, payload: dict = Body(...)):
+    def patch_user(identifier: str, request: Request, payload: dict = Body(...)):
         operations = payload.get("Operations")
         if not isinstance(operations, list) or not operations or len(operations) > 50:
             raise HTTPException(400, "Provide between 1 and 50 patch operations.")
 
         def patch(client, users):
             existing = find_user(users, identifier)
-            document = resource(existing)
+            mappings = app.state.store.settings().attribute_mappings
+            document = resource(existing, mappings, str(request.base_url).rstrip("/"))
             for operation in operations:
                 if not isinstance(operation, dict) or str(operation.get("op", "")).lower() not in ("add", "replace", "remove"):
                     raise HTTPException(400, "Unsupported patch operation.")
@@ -284,7 +371,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                     raise HTTPException(400, "Only name, displayName, and emails can be patched.")
             user = validate_user(document)
             client.write(user, existing)
-            return resource(user)
+            return resource(user, mappings, str(request.base_url).rstrip("/"))
         return directory_operation(patch, write=True)
 
     @app.delete("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])
