@@ -10,6 +10,7 @@ const defaults: Settings = {
   scim_filter: '',
   entra_client_secret_configured: false,
   ldap_url: 'ldaps://directory.example.org:636',
+  ldap_service: 'generic',
   ldap_bind_dn: 'cn=bridge,dc=example,dc=org',
   ldap_base_dn: 'ou=people,dc=example,dc=org',
   attribute_mappings: [
@@ -107,6 +108,71 @@ async function login(page: Page) {
   await page.getByRole('button', { name: 'Open console' }).click();
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
 }
+
+test('separates inbound push setup from Entra OAuth and explains password limitations', async ({ page }) => {
+  await environment(page);
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  const push = page.locator('section').filter({ has: page.getByRole('heading', { name: 'SCIM push — inbound provisioning', exact: true }) });
+  await expect(push).toContainText('/scim/v2');
+  await expect(push).toContainText('BRIDGE_SCIM_TOKEN');
+  await expect(push.getByLabel('Entra client ID')).toHaveCount(0);
+  await page.getByLabel('Provider and authentication').selectOption('entra');
+  await expect(page.getByRole('heading', { name: 'Microsoft Entra ID — OAuth pull', exact: true })).toBeVisible();
+  await expect(push).toBeVisible();
+  await expect(page.getByLabel('Entra client ID')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Password synchronization', exact: true })).toBeVisible();
+  await expect(page.getByText('SCIM passwords are write-only', { exact: false })).toBeVisible();
+});
+
+test('LDAP service selection confirms replacement, persists defaults, and highlights requirements', async ({ page }) => {
+  const env = await environment(page, {
+    enabled: true, dry_run: false,
+    attribute_mappings: [...defaults.attribute_mappings, { scim_path: 'title', ldap_attribute: 'title', direction: 'both' }],
+  });
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.getByLabel('LDAP service', { exact: true }).selectOption('active_directory');
+  await expect(page.getByLabel('LDAP service', { exact: true })).toHaveValue('generic');
+  await expect(page.getByLabel('LDAP attribute 6', { exact: true })).toHaveValue('title');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByLabel('LDAP service', { exact: true }).selectOption('active_directory');
+  await expect(page.getByLabel('LDAP attribute 1', { exact: true })).toHaveValue('sAMAccountName');
+  await expect(page.getByLabel('LDAP attribute 6', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Required attributes — Microsoft Active Directory Domain Services' })).toBeVisible();
+  await expect(page.getByText('Required by bridge', { exact: true })).toBeVisible();
+  await expect(page.getByText('New accounts are disabled', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Synchronization', exact: true }).click();
+  await expect(page.getByLabel('Dry-run mode', { exact: true })).toBeChecked();
+  await expect(page.getByLabel('Enable scheduled synchronization')).not.toBeChecked();
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).toMatchObject({ ldap_service: 'active_directory', dry_run: true, enabled: false });
+  await page.reload();
+  await page.getByLabel('Administrator token', { exact: true }).fill(token);
+  await page.getByRole('button', { name: 'Open console' }).click();
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByLabel('LDAP service', { exact: true })).toHaveValue('active_directory');
+  await expect(page.getByLabel('LDAP attribute 1', { exact: true })).toHaveValue('sAMAccountName');
+  for (const service of ['openldap', '389ds', 'generic']) {
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByLabel('LDAP service', { exact: true }).selectOption(service);
+    await expect(page.getByLabel('LDAP attribute 1', { exact: true })).toHaveValue('uid');
+    await expect(page.getByLabel('LDAP attribute 3', { exact: true })).toHaveValue('sn');
+  }
+});
+
+test('legacy settings keep generic LDAP defaults and missing surnames are highlighted', async ({ page }) => {
+  await environment(page, { ldap_service: undefined });
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByLabel('LDAP service', { exact: true })).toHaveValue('generic');
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Remove mapping 3', exact: true }).click();
+  await expect(page.getByText('Add a name.familyName mapping:', { exact: false })).toBeVisible();
+});
 
 test('authenticates, navigates every page, and never persists the token', async ({ page }) => {
   await environment(page);

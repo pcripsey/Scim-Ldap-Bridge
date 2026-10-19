@@ -1,13 +1,85 @@
 import unittest
 from unittest.mock import Mock
 
-from bridge.config import AttributeMapping, DEFAULT_ATTRIBUTE_MAPPINGS
-from bridge.connectors import (ScimClient, collect_attribute_samples, from_scim,
+from bridge.config import AttributeMapping, DEFAULT_ATTRIBUTE_MAPPINGS, Settings
+from bridge.connectors import (LdapClient, ScimClient, collect_attribute_samples, from_scim,
                                schema_attribute_details, scim_document)
 from bridge.planner import canonical
 
 
 class MappingTests(unittest.TestCase):
+    def ldap_client(self, service):
+        client = LdapClient(Settings(
+            ldap_service=service, ldap_url="ldaps://directory.example.org",
+            ldap_bind_dn="cn=bridge,dc=example,dc=org", ldap_password="test-bind-value",
+            ldap_base_dn="ou=people,dc=example,dc=org",
+        ))
+        client.connection = Mock()
+        client.connection.result = {"result": 0}
+        return client
+
+    def test_ldap_service_defaults_and_custom_mappings(self):
+        for service in ("generic", "openldap", "389ds", "active_directory"):
+            with self.subTest(service=service):
+                settings = Settings(ldap_service=service)
+                self.assertEqual(settings.attribute_mappings[0].ldap_attribute,
+                                 "sAMAccountName" if service == "active_directory" else "uid")
+                self.assertEqual(settings.attribute_mappings[2].ldap_attribute, "sn")
+        custom = [AttributeMapping(scim_path="userName", ldap_attribute="userPrincipalName")]
+        self.assertEqual(Settings(ldap_service="active_directory", attribute_mappings=custom).attribute_mappings,
+                         custom)
+        with self.assertRaises(ValueError):
+            Settings(ldap_service="unsupported")
+
+    def test_service_specific_ldap_creation(self):
+        for service in ("generic", "openldap", "389ds", "active_directory"):
+            with self.subTest(service=service):
+                client = self.ldap_client(service)
+                user = from_scim({"userName": "ada", "displayName": "Ada Lovelace",
+                                  "name": {"familyName": "Lovelace"}}, client.settings.attribute_mappings)
+                client.write(user)
+                dn, classes, attrs = client.connection.add.call_args.args
+                ad = service == "active_directory"
+                self.assertEqual(dn, ("cn" if ad else "uid") + "=ada,ou=people,dc=example,dc=org")
+                self.assertEqual(classes[-1], "user" if ad else "inetOrgPerson")
+                self.assertEqual(attrs["sn"], ["Lovelace"])
+                self.assertEqual(attrs["cn"], ["ada" if ad else "Ada Lovelace"])
+                if ad:
+                    self.assertEqual(attrs["sAMAccountName"], ["ada"])
+                    self.assertEqual(attrs["userAccountControl"], ["514"])
+                else:
+                    self.assertNotIn("userAccountControl", attrs)
+
+    def test_ad_update_does_not_rename_or_activate_account(self):
+        client = self.ldap_client("active_directory")
+        user = from_scim({"userName": "ada", "displayName": "New name",
+                          "name": {"familyName": "Lovelace"}}, client.settings.attribute_mappings)
+        client.write(user, {"_dn": "cn=ada,ou=people,dc=example,dc=org"})
+        changes = client.connection.modify.call_args.args[1]
+        self.assertNotIn("cn", changes)
+        self.assertNotIn("userAccountControl", changes)
+        self.assertIn("displayName", changes)
+        for attribute in ("cn", "userAccountControl", "objectClass", "objectCategory", "distinguishedName"):
+            with self.subTest(attribute=attribute), self.assertRaises(ValueError):
+                Settings(ldap_service="active_directory", attribute_mappings=[
+                    {"scim_path": "userName", "ldap_attribute": "sAMAccountName"},
+                    {"scim_path": "displayName", "ldap_attribute": attribute},
+                ])
+
+    def test_ldap_reads_and_discovery_use_service_filter(self):
+        for service in ("generic", "openldap", "389ds", "active_directory"):
+            client = self.ldap_client(service)
+            attribute = client.settings.attribute_mappings[0].ldap_attribute
+            client.connection.extend.standard.paged_search.return_value = [{
+                "type": "searchResEntry", "dn": "cn=ada,dc=example,dc=org",
+                "attributes": {attribute: ["ada"], "sn": ["Lovelace"]},
+            }]
+            self.assertIn("ada", client.users())
+            client.discovery()
+            for call in client.connection.extend.standard.paged_search.call_args_list:
+                self.assertEqual(call.args[1], "(&(objectClass=user)(objectCategory=person))"
+                                 if service == "active_directory" else "(objectClass=inetOrgPerson)")
+
     def test_custom_extension_values_round_trip(self):
         path = "urn:example:params:scim:schemas:extension:custom:2.0:User:costCode"
         mappings = [AttributeMapping.model_validate(item) for item in DEFAULT_ATTRIBUTE_MAPPINGS]

@@ -5,7 +5,7 @@ import {
   Play, RefreshCw, Save, Server, Settings2, ShieldCheck, X,
 } from 'lucide-react';
 import {
-  ApiError, message, normalizeSettings, request, settingsPayload,
+  ApiError, ldapDefaultMappings, ldapServices, message, normalizeSettings, request, settingsPayload,
   type AttributeDiscovery, type Event, type MappingValidation, type Operation, type Resource, type Run, type SecretEdit,
   type Secrets, type Settings, type Status,
 } from './api';
@@ -170,6 +170,8 @@ function Console({ session, onLogout }: {
     Object.values(secrets).some(secret => secret.mode !== 'keep');
   const currentPage = navigation.find(item => item.name === page)!;
   const entra = draft.scim_provider === 'entra';
+  const activeDirectory = draft.ldap_service === 'active_directory';
+  const usernameAttribute = draft.attribute_mappings.find(mapping => mapping.scim_path === 'userName')?.ldap_attribute;
   const scimReady = Boolean(saved.scim_url && (saved.scim_provider === 'entra'
     ? new RegExp(`^${guidPattern}$`).test(saved.entra_tenant_id) &&
       new RegExp(`^${guidPattern}$`).test(saved.entra_client_id) && saved.entra_client_secret_configured &&
@@ -243,6 +245,17 @@ function Console({ session, onLogout }: {
     setDiscovery({}); setShowMappingPreview(false);
   }
 
+  function selectLdapService(service: Settings['ldap_service']) {
+    if (service === draft.ldap_service) return;
+    if (!window.confirm('Changing LDAP service replaces all attribute mappings with service defaults, pauses the schedule, and enables dry run. Continue?')) return;
+    setDraft(previous => ({
+      ...previous, ldap_service: service, attribute_mappings: ldapDefaultMappings(service),
+      enabled: false, dry_run: true,
+    }));
+    setDiscovery({});
+    setShowMappingPreview(false);
+  }
+
   const plainLdap = draft.ldap_url.toLowerCase().startsWith('ldap://') ? true
     : draft.ldap_url.toLowerCase().startsWith('ldaps://') ? false : undefined;
 
@@ -276,7 +289,7 @@ function Console({ session, onLogout }: {
     if (!draft.dry_run && (saved.dry_run || (!saved.enabled && draft.enabled))) {
       warnings.push('Live mode allows writes to your directories, including inbound SCIM provisioning. Enabling the schedule will run automatically.');
     }
-    if (scopeChanged || (['scim_url', 'ldap_url', 'ldap_base_dn', 'ldap_bind_dn'] as const).some(key => draft[key] !== saved[key])) {
+    if (scopeChanged || (['scim_url', 'ldap_url', 'ldap_base_dn', 'ldap_bind_dn', 'ldap_service'] as const).some(key => draft[key] !== saved[key])) {
       warnings.push('Changing source scope or connector identity clears cached inventory and identity baselines. Confirm the provider, endpoint, tenant, client, and source filter identify the intended source before continuing.');
       warnings.push(`Source: ${draft.scim_provider}\nEndpoint: ${draft.scim_url || '(unset)'}${entra
         ? `\nTenant: ${draft.entra_tenant_id}\nClient: ${draft.entra_client_id}\nSource filter: ${draft.scim_filter || '(all users)'}` : ''}`);
@@ -392,11 +405,20 @@ function Console({ session, onLogout }: {
       <fieldset disabled={Boolean(busy) || status.running} className="settings-fields">
       {page === 'Connections' ? <>
         <Notice kind="info">Credentials are encrypted at rest. Leave a credential unchanged to keep its saved value. Changing an endpoint or LDAP identity resets inventory and baselines.</Notice>
+        <Panel title="SCIM push — inbound provisioning" subtitle="Entra or another identity provider pushes users into this bridge. No Entra app registration is needed for this connection.">
+          <dl className="details"><dt>Status</dt><dd><Badge tone={status.inbound_enabled ? 'green' : 'amber'}>{status.inbound_enabled ? 'Enabled' : 'Disabled'}</Badge></dd>
+            <dt>Tenant URL</dt><dd><code>{window.location.origin}/scim/v2</code></dd>
+            <dt>Secret token</dt><dd>BRIDGE_SCIM_TOKEN (set on the server; never displayed here)</dd></dl>
+          <p className="body-copy">Use the externally reachable HTTPS URL, including any reverse-proxy prefix. In Entra, configure Enterprise applications → Provisioning → Automatic with this tenant URL and the inbound secret token. The administrator token and outbound connector credentials are not interchangeable.</p>
+          <p className="panel-footnote">Push uses the saved LDAP connection and attribute mappings below, independently of the outbound provider and schedule. Dry run blocks inbound writes. Configure BRIDGE_SCIM_TOKEN and disable dry run only when ready.</p>
+        </Panel>
+        <Panel title="Outbound source" subtitle="Optional remote connector for scheduled or manual reconciliation; not needed for inbound SCIM push.">
+          <Field label="Provider and authentication"><select value={draft.scim_provider} onChange={event => {
+            if (event.target.value === 'generic' || event.target.value === 'entra') selectProvider(event.target.value);
+          }}><option value="generic">Generic SCIM — static bearer token</option><option value="entra">Microsoft Entra pull — OAuth client secret</option></select></Field>
+        </Panel>
         <div className="two-columns connection-forms">
-          <Panel title="SCIM provider" subtitle="Your remote SCIM 2.0 API" action={<span className="section-icon"><Network size={20} /></span>}>
-            <Field label="Provider and authentication"><select value={draft.scim_provider} onChange={event => {
-              if (event.target.value === 'generic' || event.target.value === 'entra') selectProvider(event.target.value);
-            }}><option value="generic">Generic SCIM — static bearer token</option><option value="entra">Microsoft Entra pull — OAuth client secret</option></select></Field>
+          <Panel title={entra ? 'Microsoft Entra ID — OAuth pull' : 'Generic SCIM — outbound connector'} subtitle={entra ? 'App registration credentials for reading Entra; not SCIM push credentials.' : 'Your remote SCIM 2.0 API; not this bridge’s inbound endpoint.'} action={<span className="section-icon"><Network size={20} /></span>}>
             {entra && <Notice kind="warning">Opt-in Entra pull reads users into LDAP only. Switching providers pauses the schedule and enables dry run. Verify your tenant, application, and source scope before saving. Direct group membership filtering is supported, but group provisioning, deletion, and deactivation are not. Grant application permissions User.Read.All and Group.Read.All with administrator consent.</Notice>}
             <Field label="SCIM endpoint URL" hint={entra ? 'Official Microsoft Graph SCIM endpoint. This URL cannot be changed in Entra mode.' : 'Include the base API path, for example https://identity.example.org/scim/v2. Use HTTPS outside isolated development.'}><input type="url" required={entra} readOnly={entra} placeholder="https://identity.example.org/scim/v2" value={draft.scim_url} onChange={event => update('scim_url', event.target.value)} /></Field>
             {entra ? <>
@@ -408,6 +430,13 @@ function Console({ session, onLogout }: {
             <div className="test-row"><button type="button" disabled={dirty || !scimReady} onClick={() => test('scim')}><Network size={16} />{busy === 'test-scim' ? 'Testing...' : 'Test SCIM connection'}</button></div>
           </Panel>
           <Panel title="LDAP directory" subtitle="A certificate-verified directory connection" action={<span className="section-icon"><Database size={20} /></span>}>
+            <Field label="LDAP service" hint="Selecting a different service replaces custom mappings with matching defaults and resets to dry run.">
+              <select value={draft.ldap_service} onChange={event => {
+                const service = event.target.value as Settings['ldap_service'];
+                if (service in ldapServices) selectLdapService(service);
+              }}>{Object.entries(ldapServices).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
+            </Field>
+            {activeDirectory && <Notice kind="warning">Uses AD user objects, sAMAccountName by default, and cn-based distinguished names. New accounts are disabled (userAccountControl=514); password setup and account activation must be performed with native AD tooling. This is AD DS, not Entra ID.</Notice>}
             <Field label="LDAP endpoint URL" hint="Use ldaps:// (port 636, implicit TLS) or ldap:// (port 389) with StartTLS. The server must trust the directory certificate."><input type="url" placeholder="ldaps://directory.example.org:636" value={draft.ldap_url} onChange={event => update('ldap_url', event.target.value)} /></Field>
             <Field label="Bind distinguished name"><input placeholder="cn=bridge,ou=services,dc=example,dc=org" value={draft.ldap_bind_dn} onChange={event => update('ldap_bind_dn', event.target.value)} /></Field>
             <SecretField label="LDAP bind password" configured={saved.ldap_password_configured} edit={secrets.ldap_password} onChange={edit => setSecrets(previous => ({ ...previous, ldap_password: edit }))} />
@@ -419,6 +448,13 @@ function Console({ session, onLogout }: {
           </Panel>
         </div>
         <Panel title="Attribute mapping" subtitle="Map SCIM paths to LDAP attributes. Discovery uses saved, read-only connections.">
+          <h3>Required attributes — {ldapServices[draft.ldap_service]}</h3>
+          <dl className="details"><dt>{usernameAttribute || 'User identifier'}</dt><dd><Badge tone="amber">Required identity</Badge> Mapped from userName in both directions; must be unique.</dd>
+            <dt>cn</dt><dd><Badge tone="amber">Required by schema</Badge> {activeDirectory ? 'Generated from userName for new account DNs.' : 'Generated from displayName, falling back to userName, unless explicitly mapped.'}</dd>
+            <dt>sn</dt><dd><Badge tone="amber">{activeDirectory ? 'Required by bridge' : 'Required by schema'}</Badge> Supplied by name.familyName; never fabricated.</dd></dl>
+          {!draft.attribute_mappings.some(mapping => mapping.scim_path === 'name.familyName') &&
+            <Notice kind="warning">Add a name.familyName mapping: the bridge requires a surname to create or update users.</Notice>}
+          <p className="panel-footnote">Defaults target {activeDirectory ? 'AD DS user' : 'inetOrgPerson'} objects. Custom object classes, POSIX accounts, or local schema extensions may require additional attributes. Discovery samples are not a complete schema validation.</p>
           <p className="body-copy">The userName mapping identifies accounts. Passwords and other sensitive attributes are excluded from discovery. Validation uses saved connector settings.</p>
           <div className="button-row mapping-discovery">
             <button type="button" disabled={dirty || !scimReady || Boolean(busy)}
@@ -430,7 +466,7 @@ function Console({ session, onLogout }: {
             <Field label={`SCIM path ${index + 1}`} hint="Use dotted paths for nested scalar attributes, such as name.givenName.">
               <input required list="scim-attribute-options" value={mapping.scim_path} onChange={event => update('attribute_mappings', draft.attribute_mappings.map((item, row) => row === index ? { ...item, scim_path: event.target.value } : item))} />
             </Field>
-            <Field label={`LDAP attribute ${index + 1}`}>
+            <Field label={`LDAP attribute ${index + 1}`} hint={mapping.scim_path === 'userName' ? 'Required account identity.' : mapping.ldap_attribute.toLowerCase() === 'sn' ? 'Required surname (name.familyName).' : mapping.ldap_attribute.toLowerCase() === 'cn' ? 'Required common name; generated if not mapped.' : undefined}>
               <input required list="ldap-attribute-options" value={mapping.ldap_attribute} onChange={event => update('attribute_mappings', draft.attribute_mappings.map((item, row) => row === index ? { ...item, ldap_attribute: event.target.value } : item))} />
             </Field>
             <Field label={`Direction ${index + 1}`}>
@@ -471,6 +507,11 @@ function Console({ session, onLogout }: {
             </div>)}
           </div>}
         </Panel>
+        <Panel title="Password synchronization" subtitle="Not supported — attribute provisioning does not synchronize credentials.">
+          <Notice kind="info">SCIM passwords are write-only and cannot be read back for reconciliation. Entra OAuth pull cannot retrieve existing user passwords, and Entra application provisioning is not a password-sync channel. There is no safe password-sync switch for these connectors.</Notice>
+          <p className="body-copy">For AD DS → Entra password hash synchronization, use Microsoft Entra Connect Sync or Cloud Sync where supported. That is not Entra → LDAP password export. For LDAP users, use the directory’s native password reset or a dedicated, separately secured password-change integration. The LDAP bind password above authenticates the bridge service account only.</p>
+          <p className="panel-footnote">Password mappings remain blocked. Inbound password fields are rejected by default, or dropped when “Ignore unsupported or unmapped fields” is enabled; dropping a field never changes a password.</p>
+        </Panel>
       </> : <>
         <div className="two-columns"><Panel title="Reconciliation policy" subtitle="Choose the source of truth for your identities">
           <Field label="Synchronization direction"><select value={draft.direction} onChange={event => {
@@ -488,7 +529,7 @@ function Console({ session, onLogout }: {
           <Field label="Interval (seconds)" hint="Between 30 and 86,400 seconds. The interval restarts when settings are saved."><input type="number" required min={30} max={86400} step={1} value={Number.isNaN(draft.interval_seconds) ? '' : draft.interval_seconds} onChange={event => update('interval_seconds', event.target.valueAsNumber)} /></Field>
           <dl className="details"><dt>Current schedule</dt><dd>{status.enabled ? 'Enabled' : 'Paused'}</dd><dt>Next run</dt><dd>{date(status.next_run)}</dd></dl>
         </Panel></div>
-        <Panel title="Supported mapping" subtitle="What this bridge synchronizes today"><p className="body-copy">Users are matched by username. The active mapping covers username, given name, family name, display name, and primary email using LDAP inetOrgPerson attributes.</p><p className="body-copy">Groups, deletion, passwords, lifecycle provisioning, and custom schema synchronization are not implemented. Conflicts are recorded for review, not editable here. The inventory is a cache, not the authoritative directory.</p></Panel>
+        <Panel title="Supported mapping" subtitle="What this bridge synchronizes today"><p className="body-copy">Users are matched by username. Default mappings cover username, given name, family name, display name, and primary email using the selected LDAP service profile ({ldapServices[draft.ldap_service]}).</p><p className="body-copy">Groups, deletion, passwords, lifecycle provisioning, and arbitrary custom schema synchronization are not implemented. Conflicts are recorded for review, not editable here. The inventory is a cache, not the authoritative directory.</p></Panel>
       </>}
       {saveBar}</fieldset>
     </form>}

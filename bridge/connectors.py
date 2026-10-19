@@ -499,7 +499,7 @@ class LdapClient:
         users = []
         self._search_payload()
         entries = self.connection.extend.standard.paged_search(
-            self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
+            self.settings.ldap_base_dn, self.settings.ldap_user_filter, attributes=ALL_ATTRIBUTES,
             paged_size=200, generator=True)
         for entry in entries:
             if entry["type"] != "searchResEntry":
@@ -539,7 +539,7 @@ class LdapClient:
     def discovery(self):
         self._search_payload()
         entries = self.connection.extend.standard.paged_search(
-            self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
+            self.settings.ldap_base_dn, self.settings.ldap_user_filter, attributes=ALL_ATTRIBUTES,
             paged_size=200, generator=True)
         count = 0
         for entry in entries:
@@ -565,7 +565,7 @@ class LdapClient:
 
     def write(self, user, existing=None):
         if not user["familyName"]:
-            raise ValueError("inetOrgPerson requires a nonempty familyName (sn).")
+            raise ValueError("The bridge requires a nonempty familyName (sn).")
         attrs = {}
         for mapping in self.settings.attribute_mappings:
             if mapping.direction not in ("both", "scim_to_ldap"):
@@ -576,7 +576,9 @@ class LdapClient:
             elif existing:
                 attrs[mapping.ldap_attribute] = []
         username = user["userName"]
-        attrs.setdefault("cn", [user["displayName"] or username])
+        active_directory = self.settings.ldap_service == "active_directory"
+        if not active_directory:
+            attrs.setdefault("cn", [user["displayName"] or username])
         attrs.setdefault("sn", [user["familyName"]])
         if existing:
             changes = {field: [(MODIFY_REPLACE, value)] for field, value in attrs.items()}
@@ -584,8 +586,13 @@ class LdapClient:
         else:
             username_attribute = next(mapping.ldap_attribute for mapping in self.settings.attribute_mappings
                                       if mapping.scim_path == "userName")
-            dn = f"{username_attribute}={escape_rdn(username)},{self.settings.ldap_base_dn}"
-            self._add(dn, ["top", "person", "organizationalPerson", "inetOrgPerson"],
+            rdn_attribute = "cn" if active_directory else username_attribute
+            if active_directory:
+                attrs["cn"] = [username]
+                attrs["userAccountControl"] = ["514"]
+            dn = f"{rdn_attribute}={escape_rdn(username)},{self.settings.ldap_base_dn}"
+            self._add(dn, ["top", "person", "organizationalPerson",
+                           "user" if active_directory else "inetOrgPerson"],
                       {**attrs, username_attribute: [username]})
 
     @_ldap_operation("modify")
@@ -606,7 +613,7 @@ class LdapClient:
         if debug_enabled():
             debug_event("outbound", "ldap", "search_request",
                         {"base_dn": self.settings.ldap_base_dn,
-                         "filter": "(objectClass=inetOrgPerson)", "attributes": ALL_ATTRIBUTES})
+                         "filter": self.settings.ldap_user_filter, "attributes": ALL_ATTRIBUTES})
 
     def _entry_payload(self, entry):
         if debug_enabled():

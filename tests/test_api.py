@@ -83,6 +83,29 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(response["enabled"])
         self.assertNotIn("ldap_password", response)
 
+    def test_ldap_service_change_applies_defaults_and_resets_safely(self):
+        store = self.client.app.state.store
+        store.replace_resources("ldap", "Users", {"ada": ADA})
+        store.snapshot("ada", ADA, ADA)
+        response = self.client.put("/api/settings", headers=HEADERS, json={
+            "ldap_service": "active_directory", "dry_run": False, "enabled": True,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        settings = self.client.get("/api/settings", headers=HEADERS).json()
+        self.assertEqual(settings["ldap_service"], "active_directory")
+        self.assertEqual(settings["attribute_mappings"][0]["ldap_attribute"], "sAMAccountName")
+        self.assertTrue(settings["dry_run"])
+        self.assertFalse(settings["enabled"])
+        self.assertEqual(store.snapshots(), {})
+        self.assertIsNone(store.resource("ldap", "Users", "ada"))
+        response = self.client.put("/api/settings", headers=HEADERS, json={
+            "ldap_service": "openldap", "attribute_mappings": [
+                {"scim_path": "userName", "ldap_attribute": "mail"},
+            ],
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(store.settings().attribute_mappings[0].ldap_attribute, "mail")
+
     def test_rejects_own_inbound_url_without_saving_or_resetting_inventory(self):
         self.client.app.state.store.replace_resources("scim", "Users", {"ada": ADA})
         response = self.client.put("/api/settings", headers=HEADERS,

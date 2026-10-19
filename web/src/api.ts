@@ -6,6 +6,7 @@ export interface Settings {
   scim_filter: string;
   entra_client_secret_configured: boolean;
   ldap_url: string;
+  ldap_service: 'generic' | 'openldap' | '389ds' | 'active_directory';
   ldap_bind_dn: string;
   ldap_base_dn: string;
   attribute_mappings: AttributeMapping[];
@@ -25,6 +26,23 @@ export interface AttributeMapping {
   scim_path: string;
   ldap_attribute: string;
   direction: 'both' | 'scim_to_ldap' | 'ldap_to_scim';
+}
+
+export const ldapServices = {
+  generic: 'Generic LDAP (inetOrgPerson)',
+  openldap: 'OpenLDAP',
+  '389ds': '389 Directory Server / Red Hat Directory Server',
+  active_directory: 'Microsoft Active Directory Domain Services',
+};
+
+export function ldapDefaultMappings(service: Settings['ldap_service']): AttributeMapping[] {
+  return [
+    { scim_path: 'userName', ldap_attribute: service === 'active_directory' ? 'sAMAccountName' : 'uid', direction: 'both' },
+    { scim_path: 'name.givenName', ldap_attribute: 'givenName', direction: 'both' },
+    { scim_path: 'name.familyName', ldap_attribute: 'sn', direction: 'both' },
+    { scim_path: 'displayName', ldap_attribute: 'displayName', direction: 'both' },
+    { scim_path: 'emails.value', ldap_attribute: 'mail', direction: 'both' },
+  ];
 }
 
 export interface AttributeDiscovery {
@@ -139,7 +157,7 @@ export type Secrets = { scim_token: SecretEdit; ldap_password: SecretEdit; entra
 
 export function normalizeSettings(settings: Settings): Settings {
   return Object.assign({
-    scim_provider: 'generic', entra_tenant_id: '', entra_client_id: '',
+    scim_provider: 'generic', ldap_service: 'generic', entra_tenant_id: '', entra_client_id: '',
     scim_filter: '', entra_client_secret_configured: false, ignore_unsupported_fields: false,
   }, settings);
 }
