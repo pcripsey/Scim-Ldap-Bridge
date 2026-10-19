@@ -27,6 +27,31 @@ These credentials serve different purposes:
 - Saved connector setting `scim_token`: outbound authentication to the remote
   SCIM provider; it is not either of the deployment tokens.
 
+The saved outbound `scim_url` must be the **remote provider's SCIM base URL**.
+Do not point it at this bridge's own `/scim/v2`, even through a public proxy alias.
+Inbound provisioning is an LDAP-backed service, not a proxy to the outbound provider.
+
+Set optional deployment variable `BRIDGE_SCIM_SELF_URLS` to a comma-separated list
+of this bridge's full inbound SCIM base URLs, including public proxy aliases and
+internal service addresses (for example,
+`https://bridge.example.com/scim/v2,http://bridge:8000/scim/v2`).
+Include any proxy path prefix. These endpoints are rejected on settings save and
+before outbound connector use, including scheduled jobs using existing settings.
+Scheme, hostname case/trailing dot, default port, and trailing slash are normalized;
+other paths or ports on a shared host remain available for a separate provider.
+Localhost/port combinations are not assumed to belong to the bridge: list the ones
+used by your deployment explicitly. No DNS lookup or authenticated probe is used
+to guess ownership.
+
+Settings save also rejects the inbound endpoint on the current request's base URL.
+An outbound per-process `X-SCIM-Bridge-Caller` marker catches self-calls through
+unlisted proxy aliases when they return to the same process, rejecting them with
+400 before authentication or LDAP access. The marker never grants access and is
+not a credential or a request correlation ID. Proxies must preserve this header
+for runtime detection; list aliases explicitly if headers are stripped or routing
+can reach another process. Existing bad settings remain readable so they can be
+corrected. Keep the single-instance/worker deployment restriction below.
+
 Open **http://localhost:8000/** and sign in with your administrator token. The
 Docker build compiles and bundles the React console; no separate web server or
 Node.js runtime is required in the final container.
@@ -260,6 +285,33 @@ The successful poll example requires `BRIDGE_LOG_POLLS=true` at `INFO`.
    The exception class is safe diagnostic information; do not share keys, database
    contents, tokens, or raw payloads. Rotate any credentials exposed during
    troubleshooting and share only sanitized metadata.
+
+### Diagnosing A Sync 409 Or Self-Target Rejection
+
+- Compare the saved outbound SCIM destination with the bridge's inbound URLs and
+  the deployment's DNS/reverse-proxy routes. The outbound log path `/Users` is
+  relative to the configured base URL, so it can represent an actual request to
+  this bridge's `/scim/v2/Users`.
+- Match outbound `upstream_request_id` to inbound `request_id`. The former is read
+  from the response's validated `X-Request-ID`, not forwarded in the request.
+  The outbound `request_id` instead belongs to its worker; the final `reconcile`
+  event shares that ID and links a manual trigger through `parent_id`.
+- Inbound SCIM errors expose a fixed `X-SCIM-Bridge-Error` category, also logged
+  as allowlisted `reason` metadata: `self_target` (400), `directory_busy` (409,
+  including reads), `dry_run` (409 on writes), or `uniqueness` (409 on create).
+  Outbound logs retain these categories when present; remote headers remain
+  untrusted diagnostic metadata. Arbitrary header values and bodies are not logged.
+- A reconciliation result of `conflicts` with `reason=planner_conflict` is an
+  identity/baseline decision, not an HTTP 409. A remote 409 without a bridge
+  category remains an upstream conflict requiring provider-specific investigation.
+- Correct a self-target by saving the actual remote provider base URL and its
+  provider token, then test the connection and rerun a dry-run sync. Changing the
+  connector URL clears inventory and baselines; review the new plan before live
+  writes. If only inbound provisioning is intended, leave the outbound sync schedule
+  disabled rather than configuring the bridge as its own remote provider.
+- Do not remove the directory lock or retry blindly. A genuine concurrent
+  provisioning request remains rejected while a sync holds the lock; self-call
+  retries inside that sync cannot succeed while the same lock is held.
 
 ## Management API
 

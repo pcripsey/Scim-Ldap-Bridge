@@ -3,6 +3,7 @@ import time
 
 from bridge.connectors import LdapClient, ScimClient
 from bridge.planner import canonical, plan
+from bridge.self_target import SELF_TARGET_DETAIL, SelfTargetError
 from bridge.traffic import correlation_id, elapsed, emit, new_id
 
 
@@ -73,7 +74,10 @@ class SyncService:
             result = self._run(settings, run_id)
         finally:
             try:
-                emit("internal", "sync", "reconcile", result, elapsed(start), parent_id=parent_id)
+                metadata = {"parent_id": parent_id}
+                if result == "conflicts":
+                    metadata["reason"] = "planner_conflict"
+                emit("internal", "sync", "reconcile", result, elapsed(start), **metadata)
             finally:
                 correlation_id.reset(token)
 
@@ -101,7 +105,9 @@ class SyncService:
                         except Exception as error:
                             errors += 1
                             self.store.operation_state(operation_id, "failed", type(error).__name__)
-                            self.store.event("error", f"Write failed ({type(error).__name__}); no baseline recorded.",
+                            message = SELF_TARGET_DETAIL if isinstance(error, SelfTargetError) else (
+                                f"Write failed ({type(error).__name__}); no baseline recorded.")
+                            self.store.event("error", message,
                                              decision.username, run_id)
                         else:
                             self.store.operation_state(operation_id, "applied")
@@ -121,7 +127,9 @@ class SyncService:
         except Exception as error:
             errors += 1
             status = "failed"
-            self.store.event("error", f"Reconciliation stopped ({type(error).__name__}). Check endpoints, credentials, TLS, and schema.",
+            message = SELF_TARGET_DETAIL if isinstance(error, SelfTargetError) else (
+                f"Reconciliation stopped ({type(error).__name__}). Check endpoints, credentials, TLS, and schema.")
+            self.store.event("error", message,
                              run_id=run_id)
         finally:
             try:

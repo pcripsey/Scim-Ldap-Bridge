@@ -8,10 +8,13 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from bridge.app import create_app
 from bridge.config import Settings
+from bridge.connectors import TrafficHttpClient
+from bridge.self_target import CALLER_HEADER, CALLER_ID, ERROR_HEADER
 from bridge.service import SyncService
 from bridge.traffic import (
     SafeServerErrors, TrafficMiddleware, configure_logging, correlation_id,
@@ -129,6 +132,93 @@ class TrafficTests(unittest.TestCase):
             self.assertEqual(self.records()[-1]["parent_id"], parent)
         finally:
             correlation_id.reset(token)
+
+    def test_proxy_alias_self_call_fails_before_ldap_and_keeps_correlation(self):
+        settings = Settings(scim_url="https://unlisted-proxy.example/scim/v2", scim_token=SCIM)
+        self.app.state.store.save_settings(settings)
+        sent = []
+
+        def forward(request):
+            sent.append(request)
+            response = self.client.request(request.method, "/scim/v2/Users",
+                                           headers=dict(request.headers))
+            return httpx.Response(response.status_code, headers=response.headers, content=response.content)
+
+        def http_client(**kwargs):
+            return TrafficHttpClient(**kwargs, transport=httpx.MockTransport(forward))
+
+        with patch("bridge.connectors.TrafficHttpClient", side_effect=http_client), \
+                patch("bridge.service.LdapClient") as worker_ldap, \
+                patch("bridge.app.LdapClient") as inbound_ldap:
+            run_id = self.app.state.service.trigger()
+            self.app.state.service.worker.join(timeout=5)
+            self.assertFalse(self.app.state.service.worker.is_alive())
+            inbound_ldap.assert_not_called()
+            worker_ldap.return_value.__enter__.return_value.users.assert_not_called()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].headers[CALLER_HEADER], CALLER_ID)
+        records = self.records()
+        inbound = next(item for item in records if item["direction"] == "inbound")
+        outbound = next(item for item in records if item["direction"] == "outbound")
+        reconcile = next(item for item in records if item["operation"] == "reconcile")
+        self.assertEqual(inbound["status"], 400)
+        self.assertEqual(inbound["reason"], "self_target")
+        self.assertEqual(outbound["reason"], "self_target")
+        self.assertEqual(outbound["upstream_request_id"], inbound["request_id"])
+        self.assertEqual(outbound["request_id"], reconcile["request_id"])
+        self.assertEqual(reconcile["result"], "failed")
+        self.assertFalse(self.app.state.service.lock.locked())
+        self.assertEqual(self.app.state.store.operations(), [])
+        self.assertEqual(self.app.state.store.rows("runs")[0]["id"], run_id)
+        self.assertIn("remote SCIM provider", self.app.state.store.rows("events")[0]["message"])
+        self.assertNotIn(CALLER_ID, self.output.getvalue())
+        self.assertNotIn(SCIM, self.output.getvalue())
+
+    def test_busy_response_correlates_when_proxy_strips_loop_marker(self):
+        sent = []
+
+        def forward(request):
+            sent.append(request)
+            response = self.client.get("/scim/v2/Users", headers={"Authorization": "Bearer " + SCIM})
+            return httpx.Response(response.status_code, headers=response.headers, content=response.content)
+
+        service = self.app.state.service
+        service.lock.acquire()
+        try:
+            with TrafficHttpClient(base_url="https://proxy.example/scim/v2/",
+                                   transport=httpx.MockTransport(forward)) as client:
+                with self.assertRaises(httpx.HTTPStatusError):
+                    client.get("Users").raise_for_status()
+            self.assertTrue(service.lock.locked())
+        finally:
+            service.lock.release()
+        inbound, outbound = self.records()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(inbound["status"], 409)
+        self.assertEqual(inbound["reason"], "directory_busy")
+        self.assertEqual(outbound["reason"], "directory_busy")
+        self.assertEqual(outbound["upstream_request_id"], inbound["request_id"])
+
+    def test_caller_header_never_grants_authentication(self):
+        response = self.client.get("/scim/v2/Users", headers={CALLER_HEADER: "not-this-process"})
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn(ERROR_HEADER, response.headers)
+        response = self.client.get("/scim/v2/Users", headers={CALLER_HEADER: CALLER_ID})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.headers[ERROR_HEADER], "self_target")
+        self.assertNotIn(CALLER_HEADER, response.headers)
+
+    def test_untrusted_diagnostic_headers_are_not_logged(self):
+        self.assertNotIn("reason", upstream_metadata({ERROR_HEADER.lower(): SECRET}))
+        self.assertNotIn("reason", upstream_metadata({ERROR_HEADER.lower(): "directory_busy\nforged"}))
+
+    def test_planner_conflicts_have_no_http_conflict_status(self):
+        service = self.app.state.service
+        with patch.object(service, "_run", return_value="conflicts"):
+            service.run(Settings(), 1)
+        record = self.records()[-1]
+        self.assertEqual(record["reason"], "planner_conflict")
+        self.assertNotIn("status", record)
 
     def test_poll_noise_controls_never_hide_errors(self):
         self.client.get("/healthz")

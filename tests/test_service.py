@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -72,6 +73,18 @@ class ServiceDatabaseTests(unittest.TestCase):
             ldap.return_value.__enter__.return_value.users.return_value = {"ada": ADA}
             self.run_sync(Settings(direction="ldap_to_scim"))
         self.assertEqual(self.store.operations()[0]["target"], "scim")
+
+    def test_known_self_target_fails_before_connecting_or_staging(self):
+        with patch.dict(os.environ, {"BRIDGE_SCIM_SELF_URLS": "https://bridge.example/scim/v2"}), \
+                patch("bridge.service.LdapClient") as ldap:
+            self.run_sync(Settings(scim_url="https://bridge.example/scim/v2",
+                                   scim_token="synthetic-provider-token"))
+            ldap.assert_not_called()
+        self.assertFalse(self.service.lock.locked())
+        self.assertEqual(self.store.operations(), [])
+        self.assertEqual(self.store.snapshots(), {})
+        self.assertEqual(self.store.rows("runs")[0]["status"], "failed")
+        self.assertIn("remote SCIM provider", self.store.rows("events")[0]["message"])
 
 
 if __name__ == "__main__":

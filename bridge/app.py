@@ -14,6 +14,9 @@ from bridge.config import Settings
 from bridge.connectors import LdapClient, ScimClient, from_scim, scim_document
 from bridge.schema import Catalog, ENTERPRISE_SCHEMA, USER_SCHEMA
 from bridge.service import BusyError, SyncService
+from bridge.self_target import (
+    CALLER_HEADER, CALLER_ID, ERROR_HEADER, SELF_TARGET_DETAIL, SelfTargetError, check_scim_target,
+)
 from bridge.store import Store
 from bridge.traffic import TrafficMiddleware, configure_logging
 
@@ -66,6 +69,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         authenticate(request, request.app.state.admin_token)
 
     def provisioning(request: Request):
+        if request.headers.get(CALLER_HEADER) == CALLER_ID:
+            raise HTTPException(400, SELF_TARGET_DETAIL, headers={ERROR_HEADER: "self_target"})
         if not request.app.state.scim_token:
             raise HTTPException(503, "Inbound SCIM provisioning is not enabled.")
         authenticate(request, request.app.state.scim_token)
@@ -144,7 +149,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         return current
 
     @app.put("/api/settings", dependencies=[Depends(admin)])
-    def save_settings(payload: dict = Body(...)):
+    def save_settings(request: Request, payload: dict = Body(...)):
         service, store = app.state.service, app.state.store
         if not service.lock.acquire(blocking=False):
             raise HTTPException(409, "Wait for the active directory operation to finish.")
@@ -155,6 +160,12 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             except ValidationError as error:
                 messages = [item["msg"] for item in error.errors(include_input=False, include_context=False)]
                 raise HTTPException(400, "; ".join(messages)) from None
+            try:
+                check_scim_target(current.scim_url, [str(request.base_url) + "scim/v2"])
+            except SelfTargetError:
+                raise HTTPException(400, SELF_TARGET_DETAIL) from None
+            except ValueError:
+                raise HTTPException(400, "Invalid SCIM endpoint or BRIDGE_SCIM_SELF_URLS configuration.") from None
             reset = any(getattr(old, key) != getattr(current, key)
                         for key in ("scim_url", "ldap_url", "ldap_base_dn", "ldap_bind_dn"))
             store.save_settings(current, reset=reset)
@@ -185,6 +196,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             app.state.store.event("success", f"{connector.upper()} connection verified: {count} users read.")
             return {"ok": True, "users": count}
         except Exception as error:
+            if isinstance(error, SelfTargetError):
+                raise HTTPException(400, SELF_TARGET_DETAIL) from None
             raise HTTPException(502, f"Connection failed ({type(error).__name__}). Check credentials, TLS, endpoint, and read permissions.") from None
 
     @app.post("/api/discovery/{connector}", dependencies=[Depends(admin)])
@@ -196,6 +209,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                 result = client.discovery()
             return result
         except Exception as error:
+            if isinstance(error, SelfTargetError):
+                raise HTTPException(400, SELF_TARGET_DETAIL) from None
             raise HTTPException(502, f"Attribute discovery failed ({type(error).__name__}). Check credentials, TLS, endpoint, and read permissions.") from None
 
     @app.post("/api/mappings/validate", dependencies=[Depends(admin)])
@@ -214,6 +229,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             with LdapClient(settings) as ldap_client:
                 ldap = ldap_client.discovery()
         except Exception as error:
+            if isinstance(error, SelfTargetError):
+                raise HTTPException(400, SELF_TARGET_DETAIL) from None
             raise HTTPException(502, f"Mapping validation could not inspect both connectors ({type(error).__name__}).") from None
         scim_names = {item["name"].casefold() for item in scim["attributes"]}
         ldap_names = {item["name"].casefold() for item in ldap["attributes"]}
@@ -229,11 +246,13 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     def directory_operation(callback, write=False):
         service, store = app.state.service, app.state.store
         if not service.lock.acquire(blocking=False):
-            raise HTTPException(409, "Another directory operation is in progress; retry later.")
+            raise HTTPException(409, "Another directory operation is in progress; retry later.",
+                                headers={ERROR_HEADER: "directory_busy"})
         try:
             settings = store.settings()
             if write and settings.dry_run:
-                raise HTTPException(409, "Inbound writes are blocked while dry-run mode is enabled.")
+                raise HTTPException(409, "Inbound writes are blocked while dry-run mode is enabled.",
+                                    headers={ERROR_HEADER: "dry_run"})
             with LdapClient(settings) as client:
                 result = callback(client, client.users())
             if write:
@@ -334,7 +353,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
 
         def create(client, users):
             if any(name.casefold() == user["userName"].casefold() for name in users):
-                raise HTTPException(409, "userName already exists.")
+                raise HTTPException(409, "userName already exists.", headers={ERROR_HEADER: "uniqueness"})
             client.write(user)
             created = resource(user, app.state.store.settings().attribute_mappings,
                                str(request.base_url).rstrip("/"))
