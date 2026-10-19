@@ -125,19 +125,32 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                 "runs": store.rows("runs", 30), "events": store.rows("events", 100)}
 
     @app.get("/api/data/resources", dependencies=[Depends(admin)])
-    def stored_resources(source: str | None = Query(None, pattern="^(scim|ldap)$"),
+    def stored_resources(source: str | None = Query(None, pattern="^(scim|ldap|inbound)$"),
                          resource_type: str = Query("Users", min_length=1, max_length=100),
                          limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
         return {"resources": app.state.store.resource_records(source, resource_type, limit, offset)}
 
     @app.get("/api/data/resource", dependencies=[Depends(admin)])
-    def stored_resource(source: str = Query(..., pattern="^(scim|ldap)$"),
+    def stored_resource(source: str = Query(..., pattern="^(scim|ldap|inbound)$"),
                         resource_type: str = Query("Users", min_length=1, max_length=100),
                         key: str = Query(..., min_length=1)):
         data = app.state.store.resource(source, resource_type, key)
         if data is None:
             raise HTTPException(404, "Stored resource not found.")
         return {"source": source, "resource_type": resource_type, "key": key, "data": data}
+
+    @app.delete("/api/data/pending", dependencies=[Depends(admin)])
+    def discard_pending(key: str = Query(..., min_length=1)):
+        service, store = app.state.service, app.state.store
+        if not service.lock.acquire(blocking=False):
+            raise HTTPException(409, "Wait for the active directory operation to finish.")
+        try:
+            if not store.remove_pending(key):
+                raise HTTPException(404, "Queued user not found.")
+            store.event("info", "Queued SCIM push user discarded; it was not created in LDAP.", key)
+            return {"discarded": True}
+        finally:
+            service.lock.release()
 
     @app.get("/api/data/operations", dependencies=[Depends(admin)])
     def stored_operations(limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
@@ -282,6 +295,37 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         finally:
             service.lock.release()
 
+    def with_pending(users):
+        folded = {name.casefold() for name in users}
+        queued = {name: user for name, user in app.state.store.pending_users().items()
+                  if name.casefold() not in folded}
+        return {**queued, **users}
+
+    def find_pending(identifier):
+        return next((user for name, user in app.state.store.pending_users().items()
+                     if opaque_id(name) == identifier), None)
+
+    def update_pending(identifier, request, build):
+        """Apply an inbound update to a user still waiting to be created in LDAP."""
+        service, store = app.state.service, app.state.store
+        if find_pending(identifier) is None:
+            return None
+        if not service.lock.acquire(blocking=False):
+            raise HTTPException(409, "Another directory operation is in progress; retry later.",
+                                headers={ERROR_HEADER: "directory_busy"})
+        try:
+            existing = find_pending(identifier)
+            if existing is None:
+                return None
+            user = build(existing)
+            if user is not None:
+                store.queue_user(user)
+                store.event("info", "Queued SCIM push user updated; waiting to be synchronised to LDAP.",
+                            user["userName"])
+            return resource(user or existing, store.settings().attribute_mappings, str(request.base_url).rstrip("/"))
+        finally:
+            service.lock.release()
+
     def find_user(users, identifier):
         user = next((user for user in users.values() if opaque_id(user["userName"]) == identifier), None)
         if user is None:
@@ -349,7 +393,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     def list_users(request: Request, startIndex: int = Query(1, ge=1), count: int = Query(100, ge=0, le=1000),
                    filter: str | None = None):
         def read(client, users):
-            selected = sorted(users.values(), key=lambda item: item["userName"])
+            selected = sorted(with_pending(users).values(), key=lambda item: item["userName"])
             mappings = app.state.store.settings().attribute_mappings
             if filter:
                 try:
@@ -367,26 +411,54 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     @app.get("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])
     def get_user(identifier: str, request: Request):
         mappings = app.state.store.settings().attribute_mappings
+        pending = find_pending(identifier)
+        if pending is not None:
+            return resource(pending, mappings, str(request.base_url).rstrip("/"))
         return directory_operation(lambda client, users: resource(
             find_user(users, identifier), mappings, str(request.base_url).rstrip("/")))
 
     @app.post("/scim/v2/Users", status_code=201, dependencies=[Depends(provisioning)])
     def create_user(request: Request, payload: dict = Body(...)):
         user = validate_user(payload)
-
-        def create(client, users):
-            if any(name.casefold() == user["userName"].casefold() for name in users):
-                raise HTTPException(409, "userName already exists.", headers={ERROR_HEADER: "uniqueness"})
-            client.write(user)
-            created = resource(user, app.state.store.settings().attribute_mappings,
-                               str(request.base_url).rstrip("/"))
-            return JSONResponse(created, status_code=201, media_type="application/scim+json",
-                                headers={"Location": created["meta"]["location"]})
-        return directory_operation(create, write=True)
+        service, store = app.state.service, app.state.store
+        username = user["userName"]
+        # The user is stored first and stays queued until LDAP accepts it.
+        if not store.add_pending(user):
+            raise HTTPException(409, "userName already exists.", headers={ERROR_HEADER: "uniqueness"})
+        settings = store.settings()
+        if not settings.dry_run and service.lock.acquire(blocking=False):
+            try:
+                with LdapClient(settings) as client:
+                    users = client.users()
+                    if any(name.casefold() == username.casefold() for name in users):
+                        store.remove_pending(username)
+                        raise HTTPException(409, "userName already exists.", headers={ERROR_HEADER: "uniqueness"})
+                    service.apply_pending(client, users, only=username)
+            except HTTPException:
+                raise
+            except Exception as error:
+                store.pending_attempt(username, type(error).__name__)
+            finally:
+                service.lock.release()
+        if store.pending_user(username) is None:
+            store.event("success", "Inbound SCIM provisioning completed.", username)
+        else:
+            store.event("info", "Inbound SCIM user stored; waiting to be synchronised to LDAP.", username)
+        created = resource(user, settings.attribute_mappings, str(request.base_url).rstrip("/"))
+        return JSONResponse(created, status_code=201, media_type="application/scim+json",
+                            headers={"Location": created["meta"]["location"]})
 
     @app.put("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])
     def replace_user(identifier: str, request: Request, payload: dict = Body(...)):
         user = validate_user(payload)
+
+        def replace_pending(existing):
+            if user["userName"] != existing["userName"]:
+                raise HTTPException(400, "userName is immutable in this mapping.")
+            return user
+        queued = update_pending(identifier, request, replace_pending)
+        if queued is not None:
+            return queued
 
         def replace(client, users):
             existing = find_user(users, identifier)
@@ -403,8 +475,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         if not isinstance(operations, list) or not operations or len(operations) > 50:
             raise HTTPException(400, "Provide between 1 and 50 patch operations.")
 
-        def patch(client, users):
-            existing = find_user(users, identifier)
+        def patched(existing):
             settings = app.state.store.settings()
             mappings, ignore = settings.attribute_mappings, settings.ignore_unsupported_fields
             document = resource(existing, mappings, str(request.base_url).rstrip("/"))
@@ -445,8 +516,19 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                     raise HTTPException(400, "Only name, displayName, and emails can be patched.")
             if not applied:
                 # Every operation targeted ignored attributes: a no-op that returns the unchanged resource.
+                return None
+            return validate_user(document, filter_fields=False)
+
+        queued = update_pending(identifier, request, patched)
+        if queued is not None:
+            return queued
+
+        def patch(client, users):
+            existing = find_user(users, identifier)
+            mappings = app.state.store.settings().attribute_mappings
+            user = patched(existing)
+            if user is None:
                 return resource(existing, mappings, str(request.base_url).rstrip("/"))
-            user = validate_user(document, filter_fields=False)
             client.write(user, existing)
             return resource(user, mappings, str(request.base_url).rstrip("/"))
         return directory_operation(patch, write=True)

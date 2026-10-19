@@ -7,8 +7,15 @@ from bridge.self_target import SELF_TARGET_DETAIL, SelfTargetError
 from bridge.traffic import correlation_id, elapsed, emit, new_id
 
 
+PENDING_RETRY_SECONDS = 30
+
+
 class BusyError(Exception):
     pass
+
+
+def ldap_ready(settings):
+    return all((settings.ldap_url, settings.ldap_bind_dn, settings.ldap_password, settings.ldap_base_dn))
 
 
 class SyncService:
@@ -34,8 +41,12 @@ class SyncService:
 
     def schedule(self):
         due = None
+        pending_due = time.time() + PENDING_RETRY_SECONDS
         revision = self.revision
         while not self.stop.wait(1):
+            if time.time() >= pending_due:
+                self.drain_pending()
+                pending_due = time.time() + PENDING_RETRY_SECONDS
             settings = self.store.settings()
             if revision != self.revision:
                 revision, due = self.revision, None
@@ -52,6 +63,64 @@ class SyncService:
                 except BusyError:
                     pass
                 due = time.time() + settings.interval_seconds
+
+    def apply_pending(self, client, ldap_users, only=None):
+        """Create queued inbound SCIM users in LDAP; the caller must hold self.lock.
+
+        Users stay queued until LDAP accepts them. Users that already exist in LDAP are
+        marked as conflicts for administrator review instead of being overwritten.
+        """
+        created = 0
+        existing = {name.casefold() for name in ldap_users}
+        for username, user in self.store.pending_users().items():
+            if only is not None and username.casefold() != only.casefold():
+                continue
+            if username.casefold() in existing:
+                self.store.pending_attempt(username, "userName already exists in LDAP.", conflict=True)
+                self.store.event("warning", "Queued SCIM push user already exists in LDAP; review and discard it.",
+                                 username)
+                continue
+            try:
+                client.write(user)
+            except Exception as error:
+                self.store.pending_attempt(username, type(error).__name__)
+                continue
+            self.store.remove_pending(username)
+            existing.add(username.casefold())
+            created += 1
+            self.store.event("success", "Queued SCIM push user created in LDAP.", username)
+        if created:
+            try:
+                self.store.replace_resources("ldap", "Users", client.users())
+            except Exception as error:
+                self.store.event("warning", f"LDAP inventory refresh failed ({type(error).__name__}); "
+                                 "run a sync to refresh it.")
+        return created
+
+    def drain_pending(self):
+        settings = self.store.settings()
+        if settings.dry_run or not ldap_ready(settings) or not self.store.pending_users():
+            return None
+        if not self.lock.acquire(blocking=False):
+            return None
+        token = correlation_id.set(new_id())
+        start = time.perf_counter()
+        result = "exception"
+        try:
+            with LdapClient(settings) as client:
+                created = self.apply_pending(client, client.users())
+            result = "completed"
+            return created
+        except Exception as error:
+            for username in self.store.pending_users():
+                self.store.pending_attempt(username, type(error).__name__)
+            return None
+        finally:
+            try:
+                emit("internal", "sync", "pending_users", result, elapsed(start))
+            finally:
+                correlation_id.reset(token)
+                self.lock.release()
 
     def trigger(self):
         if not self.lock.acquire(blocking=False):

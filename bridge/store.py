@@ -63,6 +63,10 @@ class Store:
                 updated_at TEXT NOT NULL, error TEXT);
             CREATE INDEX IF NOT EXISTS operations_run ON operations (run_id, id);
             CREATE INDEX IF NOT EXISTS operations_status ON operations (status);
+            CREATE TABLE IF NOT EXISTS pending_users (
+                username TEXT PRIMARY KEY, folded TEXT NOT NULL UNIQUE, data BLOB NOT NULL,
+                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
             PRAGMA user_version=1;
         """)
         self.db.execute("UPDATE runs SET status='interrupted', finished=? WHERE status='running'", (timestamp(),))
@@ -148,14 +152,65 @@ class Store:
             if cursor.rowcount != 1:
                 raise ValueError("Invalid operation transition")
 
+    def add_pending(self, user):
+        """Queue a new inbound SCIM user; returns False if the userName is already queued."""
+        username = user["userName"]
+        now = timestamp()
+        with self.lock, self.db:
+            return self.db.execute(
+                "INSERT OR IGNORE INTO pending_users (username,folded,data,status,attempts,error,created_at,updated_at) "
+                "VALUES (?,?,?,'pending',0,NULL,?,?)",
+                (username, username.casefold(), self._encrypt(user), now, now)).rowcount == 1
+
+    def queue_user(self, user):
+        """Persist an inbound SCIM user until it has been created in LDAP."""
+        username = user["userName"]
+        now = timestamp()
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO pending_users (username,folded,data,status,attempts,error,created_at,updated_at) "
+                "VALUES (?,?,?,'pending',0,NULL,?,?) ON CONFLICT(username) DO UPDATE SET "
+                "data=excluded.data, status='pending', error=NULL, updated_at=excluded.updated_at",
+                (username, username.casefold(), self._encrypt(user), now, now))
+
+    def pending_users(self, status="pending"):
+        with self.lock:
+            return {row[0]: self._decrypt(row[1]) for row in self.db.execute(
+                "SELECT username, data FROM pending_users WHERE (? IS NULL OR status=?) ORDER BY created_at, username",
+                (status, status))}
+
+    def pending_user(self, username):
+        with self.lock:
+            row = self.db.execute("SELECT username, data FROM pending_users WHERE folded=?",
+                                  (username.casefold(),)).fetchone()
+            return self._decrypt(row[1]) if row else None
+
+    def pending_attempt(self, username, error, conflict=False):
+        with self.lock, self.db:
+            self.db.execute("UPDATE pending_users SET status=?, attempts=attempts+1, error=?, updated_at=? "
+                            "WHERE username=?", ("conflict" if conflict else "pending", error, timestamp(), username))
+
+    def remove_pending(self, username):
+        with self.lock, self.db:
+            return self.db.execute("DELETE FROM pending_users WHERE folded=?",
+                                   (username.casefold(),)).rowcount == 1
+
     def resource_records(self, source=None, resource_type="Users", limit=100, offset=0):
         with self.lock:
             return [dict(row) for row in self.db.execute(
-                "SELECT source,resource_type,resource_key,observed_at,present FROM resources "
+                "SELECT source,resource_type,resource_key,observed_at,present,"
+                "CASE present WHEN 1 THEN 'present' ELSE 'absent' END AS status,"
+                "NULL AS error,NULL AS attempts FROM resources "
                 "WHERE (? IS NULL OR source=?) AND resource_type=? "
-                "ORDER BY source,resource_key LIMIT ? OFFSET ?", (source, source, resource_type, limit, offset))]
+                "UNION ALL SELECT 'inbound','Users',username,updated_at,0,"
+                "CASE status WHEN 'pending' THEN 'waiting_for_ldap' ELSE status END,error,attempts "
+                "FROM pending_users WHERE (? IS NULL OR ?='inbound') AND ?='Users' "
+                "ORDER BY source,resource_key LIMIT ? OFFSET ?",
+                (source, source, resource_type, source, source, resource_type, limit, offset))]
 
     def resource(self, source, resource_type, key):
+        if source == "inbound":
+            return self.pending_user(key) if resource_type == "Users" else None
         with self.lock:
             row = self.db.execute("SELECT data FROM resources WHERE source=? AND resource_type=? AND resource_key=?",
                                    (source, resource_type, key)).fetchone()
@@ -172,7 +227,8 @@ class Store:
             inventory = [dict(row) for row in self.db.execute(
                 "SELECT source,resource_type,COUNT(*) AS count FROM resources WHERE present=1 GROUP BY source,resource_type")]
             operations = {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM operations GROUP BY status")}
-        return {"engine": "sqlite", "inventory": inventory, "operations": operations}
+            pending = {row[0]: row[1] for row in self.db.execute("SELECT status,COUNT(*) FROM pending_users GROUP BY status")}
+        return {"engine": "sqlite", "inventory": inventory, "operations": operations, "pending_users": pending}
 
     def begin_run(self, dry_run):
         with self.lock, self.db:
