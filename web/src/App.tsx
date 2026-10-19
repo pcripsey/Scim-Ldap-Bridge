@@ -282,6 +282,9 @@ function Console({ session, onLogout }: {
         ? `\nTenant: ${draft.entra_tenant_id}\nClient: ${draft.entra_client_id}\nSource filter: ${draft.scim_filter || '(all users)'}` : ''}`);
     }
     if (Object.values(secrets).some(secret => secret.mode === 'clear')) warnings.push('Selected saved credentials will be removed.');
+    if (draft.ignore_unsupported_fields && !saved.ignore_unsupported_fields) {
+      warnings.push('Inbound SCIM requests will drop unsupported or unmapped fields instead of being rejected. Ignored account status, password, and group changes are not applied: active:false will not disable the LDAP account.');
+    }
     if (plainLdap && !draft.ldap_start_tls && draft.ldap_allow_insecure && !(saved.ldap_allow_insecure && !saved.ldap_start_tls)) {
       warnings.push('Unencrypted LDAP sends the bind password and directory data in clear text.');
     }
@@ -444,6 +447,7 @@ function Console({ session, onLogout }: {
           <datalist id="scim-attribute-options">{(discovery.scim?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <datalist id="ldap-attribute-options">{(discovery.ldap?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <div className="button-row mapping-discovery"><button type="button" onClick={() => update('attribute_mappings', [...draft.attribute_mappings, { scim_path: '', ldap_attribute: '', direction: 'both' }])}>Add mapping</button></div>
+          <label className="check-row"><input type="checkbox" aria-label="Ignore unsupported or unmapped fields" aria-describedby="ignore-unsupported-fields-hint" checked={draft.ignore_unsupported_fields} onChange={event => update('ignore_unsupported_fields', event.target.checked)} /><span><strong>Ignore unsupported or unmapped fields</strong><small id="ignore-unsupported-fields-hint">Applies to inbound SCIM user create, replace, and patch requests. When off (default), requests containing account status, password, or group fields are rejected. When on, fields that cannot be provisioned through the SCIM to LDAP mappings above, including account status (active), password, and group fields, are dropped instead. This does not add account enable/disable, password, or group support: an ignored active:false does not disable the LDAP account. userName and name.familyName are still required.</small></span></label>
           <div className="button-row mapping-discovery"><button type="button" disabled={!connected || Boolean(busy)}
             onClick={validateMappings}>{busy === 'validate-mappings' ? 'Validating...' : 'Validate mappings'}</button></div>
           <div className="button-row mapping-discovery"><button type="button" disabled={!discovery.scim || !discovery.ldap}

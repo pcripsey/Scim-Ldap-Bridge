@@ -251,6 +251,8 @@ The responsive React/TypeScript console includes:
 - **Connections:** SCIM URL/token and LDAP URL, bind DN/password, base DN, and StartTLS.
   Test saved connectors before syncing. Saved credentials are never returned;
   explicitly choose to replace or clear them, otherwise they remain unchanged.
+- **Attribute mapping** (on Connections): SCIM-to-LDAP mappings and the opt-in
+  **Ignore unsupported or unmapped fields** policy for inbound provisioning.
 - **Synchronization:** direction, conflict policy, dry-run/live mode, automatic
   scheduling, interval (30-86,400 seconds), and manual runs.
 - **Inventory:** paginated, source/type-filtered cached resources, presence state,
@@ -267,8 +269,9 @@ closing the page. Save or discard edits before testing connections or starting a
 manual run. Saving is blocked during a running directory operation; server
 validation and authorization remain authoritative.
 
-Enabling live writes, changing connector identity (which resets baselines and
-inventory), or clearing credentials requires confirmation. Live manual runs also
+Enabling live writes, enabling the ignore-unsupported-fields policy, changing
+connector identity (which resets baselines and inventory), or clearing credentials
+requires confirmation. Live manual runs also
 require confirmation. The schedule always uses **persisted** settings, so an
 already-enabled schedule continues using the previous policy until edits are saved.
 Start with dry runs, review the operation plan, then intentionally enable live mode.
@@ -561,12 +564,61 @@ to `mail`. SCIM paths are simple dotted paths, with extension attributes address
 by their full extension URN and attribute name. Mapping values are copied as-is; this
 is not a transformation language or a general-purpose schema/mapping engine.
 
+### Ignoring unsupported or unmapped inbound fields
+
+By default, inbound SCIM provisioning is **strict**: a User create, replace, or patch
+containing `active`, `password`, or `groups` is rejected with HTTP 400
+(`Account status, passwords, and group provisioning are not supported by this mapping.`).
+Some identity providers, including Microsoft Entra, always send `active`, so every
+create fails in strict mode.
+
+The **Ignore unsupported or unmapped fields** checkbox in the console's **Attribute
+mapping** section (setting `ignore_unsupported_fields`, default `false`) changes this
+for inbound `/scim/v2/Users` create, replace, and patch requests only. It is saved
+with the other encrypted settings; installations saved before this option existed
+remain strict. When enabled:
+
+- Create and replace keep only attributes the inbound mapping can apply to LDAP:
+  paths mapped `both` or `scim_to_ldap` (nested and extension paths included), plus
+  mapped `name.familyName` and `displayName` because LDAP `sn`/`cn` derive from them.
+  For `emails.value`, only each email's `value` and `primary` are kept. `active`,
+  `password`, `groups`, `externalId`, client-supplied `id`/`meta`, `ldap_to_scim`-only
+  paths, and any other unmapped attributes or sub-attributes are dropped before
+  mapping and validation. `schemas` keeps the core User schema and retained extensions.
+  Dropped values are neither written to LDAP nor echoed in responses.
+- PATCH skips operations whose path addresses no inbound-mapped attribute (for example
+  `active`, `password`, `groups[...]`, `externalId`, or an unmapped extension
+  attribute) and removes unmapped keys from path-less `value` objects and unmapped
+  sub-attributes from `name`/`emails` values. An operation left with nothing to apply
+  is skipped, so ignored fields never clear existing data. Remaining operations are
+  applied as usual. If **every** operation is ignored, the PATCH is a no-op: no LDAP
+  write occurs and the unchanged resource is returned with `200 OK`.
+- Validation is otherwise unchanged. The PATCH envelope (1-50 `Operations`), operation
+  verbs, malformed paths, mapped paths this PATCH implementation cannot apply
+  (including filtered paths such as `emails[type eq "work"].value`), `userName`
+  changes, invalid types on retained fields, authentication, dry-run blocking, and
+  the directory lock still produce the same errors.
+
+**Required attributes are still required.** `userName` must be a nonempty string, and
+LDAP `inetOrgPerson` entries require `name.familyName`. The bridge never invents a
+surname: a request such as `{"userName": "...", "active": true, "displayName": "..."}`
+still fails with `name.familyName is required by the inetOrgPerson schema.` after
+`active` is ignored. Map a surname in the provider (for example, Entra `surname` to
+`name.familyName`) before relying on this option.
+
+**Lifecycle risk:** this option does not add account enable/disable, password, or
+group support, and the advertised capabilities are unchanged. An ignored
+`active: false` **does not disable or deprovision** the LDAP account; the provider
+will report success while the account remains usable. Handle deactivation in the
+authoritative directory or another process. Outbound synchronization is not affected.
+
 This is not yet a fully SCIM-compliant or Entra-validated connector. Only User is
 advertised as a resource type. Group provisioning, deactivation, deletion, password
 operations, configurable attribute transforms/defaults, full multivalue mapping, and
 arbitrary custom schema discovery/provisioning are not implemented. PATCH supports
 only `name`, `name.givenName`, `name.familyName`, `displayName`, and `emails` paths,
-not every writable User attribute or every SCIM path/value combination. LDAP writes still use the
+not every writable User attribute or every SCIM path/value combination (see the
+ignore option above for skipping unsupported paths). LDAP writes still use the
 `inetOrgPerson` object classes and require a family name. Validate actual Entra
 provisioning behavior in a test tenant before production use.
 
