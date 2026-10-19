@@ -26,6 +26,7 @@ const defaults: Settings = {
   interval_seconds: 300,
   enabled: false,
   dry_run: true,
+  ignore_unsupported_fields: false,
   scim_token_configured: true,
   ldap_password_configured: true,
 };
@@ -386,6 +387,57 @@ test('discovers attributes and saves editable mappings', async ({ page }) => {
       { scim_path: 'employeeNumber', ldap_attribute: 'employeeNumber', direction: 'both' },
     ]),
   });
+});
+
+test('ignoring unsupported fields is an explicit, persisted, reversible choice', async ({ page }) => {
+  const env = await environment(page);
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  const checkbox = page.getByRole('checkbox', { name: 'Ignore unsupported or unmapped fields' });
+  await expect(checkbox).not.toBeChecked();
+  await expect(checkbox).toHaveAccessibleDescription(/active:false does not disable the LDAP account/);
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  await checkbox.check();
+  await expect(page.getByText('You have unsaved changes')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeEnabled();
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  await expect(checkbox).toBeChecked();
+  page.once('dialog', async dialog => {
+    expect(dialog.message()).toContain('active:false will not disable the LDAP account');
+    await dialog.accept();
+  });
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).toMatchObject({ ignore_unsupported_fields: true });
+  expect(env.writes[0]).not.toHaveProperty('scim_token');
+  expect(env.calls.filter(call => call === 'GET /api/settings')).toHaveLength(2);
+  await expect(checkbox).toBeChecked();
+  await expect(page.getByText('All changes saved')).toBeVisible();
+  await checkbox.uncheck();
+  await expect(page.getByRole('button', { name: 'Discard' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('All changes saved')).toBeVisible();
+  expect(env.writes[1]).toMatchObject({ ignore_unsupported_fields: false });
+  await expect(checkbox).not.toBeChecked();
+});
+
+test('legacy settings without the ignore policy default to strict validation', async ({ page }) => {
+  const env = await environment(page);
+  const legacy: Record<string, unknown> = { ...defaults };
+  delete legacy.ignore_unsupported_fields;
+  await page.route('**/api/settings', route => route.request().method() === 'GET'
+    ? route.fulfill({ json: legacy }) : route.fallback());
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByRole('checkbox', { name: 'Ignore unsupported or unmapped fields' })).not.toBeChecked();
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Synchronization', exact: true }).click();
+  await page.getByLabel('Interval (seconds)').fill('600');
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).toMatchObject({ ignore_unsupported_fields: false, interval_seconds: 600 });
 });
 
 test('live settings and live runs require confirmation', async ({ page }) => {

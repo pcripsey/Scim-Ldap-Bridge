@@ -16,6 +16,7 @@ export interface Settings {
   interval_seconds: number;
   enabled: boolean;
   dry_run: boolean;
+  ignore_unsupported_fields: boolean;
   scim_token_configured: boolean;
   ldap_password_configured: boolean;
 }
@@ -139,7 +140,7 @@ export type Secrets = { scim_token: SecretEdit; ldap_password: SecretEdit; entra
 export function normalizeSettings(settings: Settings): Settings {
   return Object.assign({
     scim_provider: 'generic', entra_tenant_id: '', entra_client_id: '',
-    scim_filter: '', entra_client_secret_configured: false,
+    scim_filter: '', entra_client_secret_configured: false, ignore_unsupported_fields: false,
   }, settings);
 }
 
