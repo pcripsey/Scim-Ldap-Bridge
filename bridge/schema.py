@@ -1,6 +1,7 @@
 from copy import deepcopy
+from typing import Union
 
-from scim2_models import EnterpriseUser, Group, Path, Schema, ScimFilter, User
+from scim2_models import EnterpriseUser, Extension, Group, Path, Schema, ScimFilter, User
 
 
 USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
@@ -16,9 +17,9 @@ class Catalog:
             schema = Schema.model_validate(definition)
             if schema.id in {item.id for item in self.schemas}:
                 raise ValueError("Custom schema IDs must be unique and cannot replace core schemas.")
-            extensions.append(User.from_schema(schema))
+            extensions.append(Extension.from_schema(schema))
             self.schemas.append(schema)
-        self.models = {"Users": User[tuple(extensions)], "Groups": Group}
+        self.models = {"Users": User[Union[tuple(extensions)]], "Groups": Group}
 
     def validate(self, kind, document):
         return self.models[kind].model_validate(document)
