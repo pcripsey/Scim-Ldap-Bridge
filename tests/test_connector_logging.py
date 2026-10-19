@@ -308,6 +308,29 @@ class ConnectorLoggingTests(unittest.TestCase):
                 raise original
         self.assertIs(raised.exception, original)
 
+    def test_ldap_unbind_ignores_stale_result_from_previous_operation(self):
+        client = self.ldap()
+        for code in (49, 50):
+            client.connection.result = {"result": code, "message": SECRET}
+            client.connection.unbind.return_value = True
+            client.__exit__(None, None, None)
+            self.assertEqual(self.events[-1]["operation"], "unbind")
+            self.assertEqual(self.events[-1]["result"], "success")
+            self.assertNotIn("ldap_result", self.events[-1])
+        client.connection.unbind.return_value = False
+        client.__exit__(None, None, None)
+        self.assertEqual(self.events[-1]["result"], "ldap_error")
+        self.assertNotIn("ldap_result", self.events[-1])
+        error = RuntimeError(SECRET)
+        error.result = 49
+        client.connection.unbind.side_effect = error
+        with self.assertRaises(RuntimeError) as raised:
+            client.__exit__(None, None, None)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.events[-1]["result"], "error")
+        self.assertNotIn("ldap_result", self.events[-1])
+        self.assert_safe()
+
     def test_ldap_malformed_result_metadata_never_masks_operation(self):
         client = self.ldap()
         for raw in (None, SECRET, {"result": SECRET}, {"result": [SECRET]},

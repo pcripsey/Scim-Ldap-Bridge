@@ -317,10 +317,10 @@ class LdapClient:
                 metadata["count"] = self._traffic_entry_count
             result = "success"
             code = None
-            if self.connection is not None:
+            if self.connection is not None and operation != "unbind":
                 raw = self.connection.result
                 code = raw.get("result") if isinstance(raw, dict) else None
-            if error is not None:
+            if error is not None and operation != "unbind":
                 try:
                     error_code = getattr(error, "result", None)
                     if type(error_code) is int and 0 <= error_code <= 4096:
