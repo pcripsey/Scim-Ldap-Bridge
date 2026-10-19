@@ -286,8 +286,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             document = filter_inbound(document, settings.attribute_mappings)
         if not isinstance(document.get("userName"), str) or not document["userName"].strip():
             raise HTTPException(400, "userName must be a nonempty string.")
-        if not settings.ignore_unsupported_fields and (
-                "active" in document or "password" in document or "groups" in document):
+        # Mapping paths can never retain these fields, so this only applies when they were not filtered.
+        if "active" in document or "password" in document or "groups" in document:
             raise HTTPException(400, "Account status, passwords, and group provisioning are not supported by this mapping.")
         try:
             user = from_scim(document, settings.attribute_mappings)
