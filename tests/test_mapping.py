@@ -25,6 +25,17 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(result[path.rsplit(":", 1)[0]]["costCode"], "042")
         self.assertIn(path.rsplit(":", 1)[0], result["schemas"])
 
+    def test_empty_custom_value_removes_existing_scim_attribute(self):
+        schema = "urn:example:params:scim:schemas:extension:custom:2.0:User"
+        path = schema + ":costCode"
+        mappings = [AttributeMapping.model_validate(item) for item in DEFAULT_ATTRIBUTE_MAPPINGS]
+        mappings.append(AttributeMapping(scim_path=path, ldap_attribute="employeeNumber"))
+        result = scim_document(from_scim({"userName": "ada"}, mappings),
+                               {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User", schema],
+                                schema: {"costCode": "042"}}, mappings)
+        self.assertNotIn(schema, result)
+        self.assertNotIn(schema, result["schemas"])
+
     def test_mapping_rejects_sensitive_and_read_only_paths(self):
         for path in ("password", "meta.version", "groups.value", "active"):
             with self.subTest(path=path), self.assertRaises(ValueError):
@@ -83,6 +94,10 @@ class MappingTests(unittest.TestCase):
             client.write(user, {"_id": "resource-1", "_raw": {"userName": "ada"}})
             operations = client.client.patch.call_args.kwargs["json"]["Operations"]
             self.assertIn({"op": "replace", "path": "employeeNumber", "value": "042"}, operations)
+            client.write(from_scim({"userName": "ada"}, mappings),
+                         {"_id": "resource-1", "_raw": {"userName": "ada", "employeeNumber": "042"}})
+            clear_operations = client.client.patch.call_args.kwargs["json"]["Operations"]
+            self.assertIn({"op": "remove", "path": "employeeNumber"}, clear_operations)
         finally:
             client.client.close()
 

@@ -81,9 +81,20 @@ def set_scim_value(document, path, value):
         return
     parts = mapping_parts(path)
     target = document
+    parents = []
     for part in parts[:-1]:
+        parents.append((target, part))
+        if value in (None, "") and part not in target:
+            return
         target = target.setdefault(part, {})
-    if value not in (None, ""):
+    if value in (None, ""):
+        target.pop(parts[-1], None)
+        for parent, key in reversed(parents):
+            if isinstance(parent.get(key), dict) and not parent[key]:
+                del parent[key]
+            else:
+                break
+    else:
         target[parts[-1]] = value
 
 
@@ -106,9 +117,11 @@ def scim_document(user, existing=None, mappings=None):
         if direction in ("both", "ldap_to_scim"):
             set_scim_value(document, path, mapped_value(user, path))
             if path.startswith("urn:"):
-                schema, _ = path.rsplit(":", 1)
-                if schema not in document["schemas"]:
+                schema = mapping_parts(path)[0]
+                if schema in document and schema not in document["schemas"]:
                     document["schemas"].append(schema)
+                elif schema not in document and schema in document["schemas"]:
+                    document["schemas"].remove(schema)
     return document
 
 
@@ -193,7 +206,10 @@ class ScimClient:
                 if any(operation["path"] == patch_path for operation in operations):
                     continue
                 value = document.get("emails", []) if path == "emails.value" else scim_value(document, path)
-                operations.append({"op": "replace", "path": patch_path, "value": value})
+                if value in (None, "") or (patch_path == "emails" and not value):
+                    operations.append({"op": "remove", "path": patch_path})
+                else:
+                    operations.append({"op": "replace", "path": patch_path, "value": value})
             response = self.client.patch("Users/" + quote(str(existing["_id"]), safe=""),
                                          json={"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
                                                "Operations": operations},

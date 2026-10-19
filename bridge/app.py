@@ -31,7 +31,7 @@ def resource(user, mappings=None, base_url=""):
     location = f"{base_url.rstrip('/')}/scim/v2/Users/{identifier}"
     metadata = dict((user.get("_raw") or {}).get("meta") or {})
     metadata.update({"resourceType": "User", "location": location})
-    return {**scim_document(user, mappings=mappings), "id": identifier,
+    return {**scim_document(user, user.get("_raw"), mappings), "id": identifier,
             "meta": metadata}
 
 
