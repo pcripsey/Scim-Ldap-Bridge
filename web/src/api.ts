@@ -7,6 +7,7 @@ export interface Settings {
   entra_client_secret_configured: boolean;
   ldap_url: string;
   ldap_service: 'generic' | 'openldap' | '389ds' | 'active_directory';
+  ad_enable_new_accounts: boolean;
   ldap_bind_dn: string;
   ldap_base_dn: string;
   attribute_mappings: AttributeMapping[];
@@ -157,7 +158,7 @@ export type Secrets = { scim_token: SecretEdit; ldap_password: SecretEdit; entra
 
 export function normalizeSettings(settings: Settings): Settings {
   return Object.assign({
-    scim_provider: 'generic', ldap_service: 'generic', entra_tenant_id: '', entra_client_id: '',
+    scim_provider: 'generic', ldap_service: 'generic', ad_enable_new_accounts: false, entra_tenant_id: '', entra_client_id: '',
     scim_filter: '', entra_client_secret_configured: false, ignore_unsupported_fields: false,
   }, settings);
 }

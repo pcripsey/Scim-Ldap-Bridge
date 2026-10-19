@@ -250,6 +250,7 @@ function Console({ session, onLogout }: {
     if (!window.confirm('Changing LDAP service replaces all attribute mappings with service defaults, pauses the schedule, and enables dry run. Continue?')) return;
     setDraft(previous => ({
       ...previous, ldap_service: service, attribute_mappings: ldapDefaultMappings(service),
+      ad_enable_new_accounts: false,
       enabled: false, dry_run: true,
     }));
     setDiscovery({});
@@ -284,6 +285,9 @@ function Console({ session, onLogout }: {
       return;
     }
     const warnings: string[] = [];
+    if (draft.ad_enable_new_accounts && !saved.ad_enable_new_accounts) {
+      warnings.push('New AD accounts will receive a generated, undisclosed password and be enabled after successful password initialization. Existing accounts are unchanged. Users need a separate password-reset process.');
+    }
     const scopeChanged = (['scim_provider', 'entra_tenant_id', 'entra_client_id', 'scim_filter'] as const)
       .some(key => draft[key] !== saved[key]);
     if (!draft.dry_run && (saved.dry_run || (!saved.enabled && draft.enabled))) {
@@ -436,7 +440,11 @@ function Console({ session, onLogout }: {
                 if (service in ldapServices) selectLdapService(service);
               }}>{Object.entries(ldapServices).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
             </Field>
-            {activeDirectory && <Notice kind="warning">Uses AD user objects, sAMAccountName by default, and cn-based distinguished names. New accounts are disabled (userAccountControl=514); password setup and account activation must be performed with native AD tooling. This is AD DS, not Entra ID.</Notice>}
+            {activeDirectory && <>
+              <Notice kind="warning">Uses AD user objects, sAMAccountName by default, and cn-based distinguished names. New accounts are disabled by default (userAccountControl=514). This is AD DS, not Entra ID.</Notice>
+              <label className="check-row"><input type="checkbox" aria-label="Enable new AD accounts" checked={draft.ad_enable_new_accounts} onChange={event => update('ad_enable_new_accounts', event.target.checked)} /><span><strong>Enable new AD accounts</strong><small>Opt in to generating a strong random password, setting it over verified LDAPS or StartTLS, then enabling each new account. Passwords are never saved or displayed. Existing accounts are unchanged. Requires delegated password-reset and account-control permissions.</small></span></label>
+              {draft.ad_enable_new_accounts && <Notice kind="warning">Users need a separate password-reset process to sign in. A failed password initialization leaves the account disabled; failed activation requires administrator review. Retries do not activate already-created accounts.</Notice>}
+            </>}
             <Field label="LDAP endpoint URL" hint="Use ldaps:// (port 636, implicit TLS) or ldap:// (port 389) with StartTLS. The server must trust the directory certificate."><input type="url" placeholder="ldaps://directory.example.org:636" value={draft.ldap_url} onChange={event => update('ldap_url', event.target.value)} /></Field>
             <Field label="Bind distinguished name"><input placeholder="cn=bridge,ou=services,dc=example,dc=org" value={draft.ldap_bind_dn} onChange={event => update('ldap_bind_dn', event.target.value)} /></Field>
             <SecretField label="LDAP bind password" configured={saved.ldap_password_configured} edit={secrets.ldap_password} onChange={edit => setSecrets(previous => ({ ...previous, ldap_password: edit }))} />
@@ -508,6 +516,7 @@ function Console({ session, onLogout }: {
           </div>}
         </Panel>
         <Panel title="Password synchronization" subtitle="Not supported — attribute provisioning does not synchronize credentials.">
+          <p className="body-copy">The AD-only “Enable new AD accounts” option initializes a fresh, undisclosed random password for new accounts. It does not synchronize a source password or change existing accounts.</p>
           <Notice kind="info">SCIM passwords are write-only and cannot be read back for reconciliation. Entra OAuth pull cannot retrieve existing user passwords, and Entra application provisioning is not a password-sync channel. There is no safe password-sync switch for these connectors.</Notice>
           <p className="body-copy">For AD DS → Entra password hash synchronization, use Microsoft Entra Connect Sync or Cloud Sync where supported. That is not Entra → LDAP password export. For LDAP users, use the directory’s native password reset or a dedicated, separately secured password-change integration. The LDAP bind password above authenticates the bridge service account only.</p>
           <p className="panel-footnote">Password mappings remain blocked. Inbound password fields are rejected by default, or dropped when “Ignore unsupported or unmapped fields” is enabled; dropping a field never changes a password.</p>

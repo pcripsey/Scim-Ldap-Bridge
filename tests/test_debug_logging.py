@@ -43,6 +43,26 @@ class DebugLoggingTests(unittest.TestCase):
     def records(self):
         return [json.loads(line) for line in self.output.getvalue().splitlines()]
 
+    def test_ad_generated_password_is_redacted_even_at_debug(self):
+        client = LdapClient(Settings(
+            ldap_service="active_directory", ad_enable_new_accounts=True,
+            ldap_url="ldaps://directory.example.org", ldap_bind_dn="cn=bridge",
+            ldap_password="test-bind", ldap_base_dn="dc=example,dc=org", dry_run=False,
+        ))
+        client.connection = Mock()
+        client.connection.server.ssl = True
+        client.connection.result = {"result": 0}
+        client.connection.add.return_value = True
+        client.connection.modify.return_value = True
+        with patch("bridge.connectors.secrets.token_urlsafe", return_value=SECRET):
+            client.write(from_scim({"userName": "ada", "name": {"familyName": "Lovelace"}}))
+        password_event = next(record for record in self.records()
+                              if record["operation"] == "modify_attributes"
+                              and "unicodePwd" in record["data"]["changes"])
+        self.assertEqual(password_event["data"]["changes"]["unicodePwd"], REDACTED)
+        self.assertNotIn(SECRET, self.output.getvalue())
+        self.assertNotIn(repr(('"aA1!' + SECRET + '"').encode("utf-16-le")), self.output.getvalue())
+
     def app_client(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

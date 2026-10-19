@@ -11,6 +11,7 @@ const defaults: Settings = {
   entra_client_secret_configured: false,
   ldap_url: 'ldaps://directory.example.org:636',
   ldap_service: 'generic',
+  ad_enable_new_accounts: false,
   ldap_bind_dn: 'cn=bridge,dc=example,dc=org',
   ldap_base_dn: 'ou=people,dc=example,dc=org',
   attribute_mappings: [
@@ -172,6 +173,32 @@ test('legacy settings keep generic LDAP defaults and missing surnames are highli
   await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
   await page.getByRole('button', { name: 'Remove mapping 3', exact: true }).click();
   await expect(page.getByText('Add a name.familyName mapping:', { exact: false })).toBeVisible();
+});
+
+test('AD activation is opt-in, confirmed on save, and cleared when switching LDAP service', async ({ page }) => {
+  const env = await environment(page, { ldap_service: 'active_directory' });
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByLabel('Enable new AD accounts', { exact: true })).not.toBeChecked();
+  await page.getByLabel('Enable new AD accounts', { exact: true }).check();
+  await expect(page.getByText('Users need a separate password-reset process to sign in.', { exact: false })).toBeVisible();
+  page.once('dialog', async dialog => {
+    expect(dialog.message()).toContain('generated, undisclosed password');
+    await dialog.dismiss();
+  });
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).toMatchObject({ ad_enable_new_accounts: true });
+  await expect(page.getByLabel('Enable new AD accounts', { exact: true })).toBeChecked();
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByLabel('LDAP service', { exact: true }).selectOption('openldap');
+  await expect(page.getByLabel('Enable new AD accounts', { exact: true })).toHaveCount(0);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByLabel('LDAP service', { exact: true }).selectOption('active_directory');
+  await expect(page.getByLabel('Enable new AD accounts', { exact: true })).not.toBeChecked();
 });
 
 test('authenticates, navigates every page, and never persists the token', async ({ page }) => {

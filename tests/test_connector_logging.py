@@ -174,6 +174,20 @@ class ConnectorLoggingTests(unittest.TestCase):
                 client.client.get("Users")
         self.assertIs(raised.exception, error)
 
+    def test_ad_activation_disables_referrals_and_verifies_certificates(self):
+        for url in ("ldaps://directory.example.org", "ldap://directory.example.org"):
+            client = self.ldap(ldap_service="active_directory")
+            client.settings.ldap_url = url
+            client.settings.ad_enable_new_accounts = True
+            connection = Mock(result={"result": 0})
+            with patch("bridge.connectors.Server"), patch("bridge.connectors.Tls") as tls, \
+                    patch("bridge.connectors.Connection", return_value=connection) as factory:
+                client.__enter__()
+            self.assertFalse(factory.call_args.kwargs["auto_referrals"])
+            self.assertEqual(tls.call_args.kwargs["validate"], ssl.CERT_REQUIRED)
+            self.assertEqual(factory.call_args.kwargs["auto_bind"],
+                             AUTO_BIND_NO_TLS if url.startswith("ldaps") else AUTO_BIND_TLS_BEFORE_BIND)
+
     def test_ldap_connect_preserves_auto_bind_and_tls_validation(self):
         for url, start_tls, insecure, expected_bind, mode in [
                 ("ldaps://directory.example.org", True, False, AUTO_BIND_NO_TLS, "ldaps"),
@@ -191,6 +205,7 @@ class ConnectorLoggingTests(unittest.TestCase):
             self.assertEqual(factory.call_args.kwargs["password"], SECRET)
             self.assertEqual(tls.call_args.kwargs["validate"], ssl.CERT_REQUIRED)
             self.assertEqual(server.call_args.kwargs["use_ssl"], mode == "ldaps")
+            self.assertTrue(factory.call_args.kwargs["auto_referrals"])
             self.assertEqual(self.events[-1]["tls_mode"], mode)
             self.assertEqual(self.events[-1]["operation"],
                              "connect_starttls_bind" if mode == "starttls" else "connect_bind")

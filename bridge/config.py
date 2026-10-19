@@ -75,6 +75,7 @@ class Settings(BaseModel):
     entra_client_secret: str = Field(default="", repr=False)
     scim_filter: str = Field(default="", max_length=2048)
     ldap_service: Literal["generic", "openldap", "389ds", "active_directory"] = "generic"
+    ad_enable_new_accounts: bool = Field(default=False, strict=True)
     ldap_url: str = ""
     ldap_bind_dn: str = ""
     ldap_password: str = Field(default="", repr=False)
@@ -117,6 +118,12 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_endpoints(self):
+        if self.ad_enable_new_accounts:
+            if self.ldap_service != "active_directory":
+                raise ValueError("New account activation is only available for Active Directory.")
+            if not (self.ldap_url.lower().startswith("ldaps://")
+                    or (self.ldap_url.lower().startswith("ldap://") and self.ldap_start_tls)):
+                raise ValueError("AD account activation requires LDAPS or StartTLS.")
         paths = [item.scim_path.casefold() for item in self.attribute_mappings]
         attributes = [item.ldap_attribute.casefold() for item in self.attribute_mappings]
         if len(paths) != len(set(paths)) or len(attributes) != len(set(attributes)):

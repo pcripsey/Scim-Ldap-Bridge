@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+from ldap3 import MODIFY_REPLACE
 
 from bridge.config import AttributeMapping, DEFAULT_ATTRIBUTE_MAPPINGS, Settings
 from bridge.connectors import (LdapClient, ScimClient, collect_attribute_samples, from_scim,
@@ -17,6 +19,98 @@ class MappingTests(unittest.TestCase):
         client.connection = Mock()
         client.connection.result = {"result": 0}
         return client
+
+    def activating_client(self):
+        client = self.ldap_client("active_directory")
+        client.settings = Settings.model_validate({
+            **client.settings.model_dump(), "ad_enable_new_accounts": True, "dry_run": False,
+        })
+        client.connection.server.ssl = True
+        client.connection.tls_started = False
+        client.connection.add.return_value = True
+        client.connection.modify.return_value = True
+        return client
+
+    def test_new_ad_account_is_initialized_before_activation(self):
+        client = self.activating_client()
+        user = from_scim({"userName": "ada", "name": {"familyName": "Lovelace"}},
+                         client.settings.attribute_mappings)
+        with patch("bridge.connectors.secrets.token_urlsafe", return_value="generated-test-value") as random:
+            client.write(user)
+        random.assert_called_once_with(48)
+        calls = client.connection.method_calls
+        self.assertEqual([call[0] for call in calls], ["add", "modify", "modify"])
+        self.assertEqual(calls[0].args[2]["userAccountControl"], ["514"])
+        self.assertEqual(calls[1].args[1], {
+            "unicodePwd": [(MODIFY_REPLACE, ['"aA1!generated-test-value"'.encode("utf-16-le")])],
+        })
+        self.assertEqual(calls[2].args[1], {"userAccountControl": [(MODIFY_REPLACE, ["512"])]})
+        self.assertNotIn("password", user)
+        self.assertNotIn("unicodePwd", user)
+
+    def test_ad_activation_never_changes_existing_accounts(self):
+        client = self.activating_client()
+        user = from_scim({"userName": "ada", "name": {"familyName": "Lovelace"}},
+                         client.settings.attribute_mappings)
+        with patch("bridge.connectors.secrets.token_urlsafe") as random:
+            client.write(user, {"_dn": "cn=ada,dc=example,dc=org"})
+        random.assert_not_called()
+        client.connection.add.assert_not_called()
+        changes = client.connection.modify.call_args.args[1]
+        self.assertNotIn("unicodePwd", changes)
+        self.assertNotIn("userAccountControl", changes)
+
+    def test_ad_activation_rejects_plain_connections_and_dry_runs_before_creation(self):
+        for dry_run, ssl, starttls, allowed in (
+                (False, False, False, False), (True, True, False, False),
+                (False, False, True, True)):
+            client = self.activating_client()
+            client.settings.dry_run = dry_run
+            client.connection.server.ssl = ssl
+            client.connection.tls_started = starttls
+            user = from_scim({"userName": "ada", "name": {"familyName": "Lovelace"}},
+                             client.settings.attribute_mappings)
+            if allowed:
+                client.write(user)
+                self.assertEqual(client.connection.modify.call_count, 2)
+            else:
+                with self.assertRaises(ValueError):
+                    client.write(user)
+                client.connection.add.assert_not_called()
+                client.connection.modify.assert_not_called()
+
+    def test_ad_activation_stops_after_each_failed_step(self):
+        for step in ("add", "password", "activation"):
+            for failure in (False, RuntimeError("test directory failure")):
+                with self.subTest(step=step, failure=type(failure).__name__):
+                    client = self.activating_client()
+                    if step == "add":
+                        if failure is False:
+                            client.connection.add.return_value = False
+                        else:
+                            client.connection.add.side_effect = failure
+                    else:
+                        client.connection.modify.side_effect = (
+                            [failure] if step == "password" else [True, failure])
+                    user = from_scim({"userName": "ada", "name": {"familyName": "Lovelace"}},
+                                     client.settings.attribute_mappings)
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        client.write(user)
+                    self.assertEqual(client.connection.modify.call_count,
+                                     {"add": 0, "password": 1, "activation": 2}[step])
+
+    def test_ad_activation_configuration_requires_ad_and_tls(self):
+        self.assertFalse(Settings().ad_enable_new_accounts)
+        for values in (
+            {"ldap_service": "generic", "ldap_url": "ldaps://directory.example.org"},
+            {"ldap_service": "active_directory", "ldap_url": ""},
+            {"ldap_service": "active_directory", "ldap_url": "ldap://directory.example.org",
+             "ldap_start_tls": False, "ldap_allow_insecure": True},
+            {"ldap_service": "active_directory", "ldap_url": "ldaps://directory.example.org",
+             "ad_enable_new_accounts": "true"},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                Settings(**{"ad_enable_new_accounts": True, **values})
 
     def test_ldap_service_defaults_and_custom_mappings(self):
         for service in ("generic", "openldap", "389ds", "active_directory"):

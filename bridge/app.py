@@ -162,6 +162,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                 values = {**old.model_dump(), **payload}
                 if values["ldap_service"] != old.ldap_service:
                     values.update(enabled=False, dry_run=True)
+                    if values["ldap_service"] != "active_directory":
+                        values["ad_enable_new_accounts"] = False
                     if "attribute_mappings" not in payload:
                         values.pop("attribute_mappings")
                 current = Settings.model_validate(values)

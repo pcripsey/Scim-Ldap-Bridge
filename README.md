@@ -585,8 +585,26 @@ be mapped in both directions and unique in the search base. Supply
 username attribute forms the RDN. AD uses `cn=<escaped userName>` for new DNs;
 display-name updates do not rename existing AD accounts.
 
-AD creates **disabled** accounts (`userAccountControl=514`). Set passwords and
-activate accounts using native AD tooling; this bridge does neither. AD naming,
+AD creates **disabled** accounts (`userAccountControl=514`) by default. Opt in to
+**Enable new AD accounts** in Connections (`ad_enable_new_accounts=true` in the
+API) to initialize a cryptographically random password over certificate-verified
+LDAPS or StartTLS, then enable the newly created account (`userAccountControl=512`).
+The password is generated in memory, never returned or persisted, and is not
+synchronized from the source. Users need a separate password-reset process.
+Delegate user creation, password reset, and account-control permissions to the
+bind identity. Referral following is disabled for this option.
+
+Creation is ordered: add disabled, set password, enable only after success.
+Password-policy rejection leaves the new account disabled. Activation errors or
+network timeouts require administrator review; the directory may have committed
+an operation before a connection failure. Partial accounts are not deleted.
+Retries treat already-created accounts as existing and do not reset their
+passwords or activate them. Existing accounts are always unchanged by this option.
+Dry runs do not initialize passwords or enable accounts. Changing LDAP service
+in the console clears the opt-in. Test against your domain password policy before
+production use; custom password filters may reject generated passwords.
+
+Without this option, set passwords and activate accounts using native AD tooling. AD naming,
 object class, and account status attributes cannot be mapped. Use an appropriate
 OU/base DN, delegated create/update permissions, and directory-valid usernames
 (including AD's `sAMAccountName` constraints). AD DS is not Microsoft Entra ID.
@@ -606,7 +624,8 @@ compliance.
 
 ### Password synchronization feasibility
 
-There is intentionally **no password-sync toggle**. SCIM's `password` attribute
+There is intentionally **no password-sync toggle**; the new-account initialization
+option above is not password synchronization. SCIM's `password` attribute
 is write-only, so reconciliation cannot retrieve existing passwords. Entra OAuth
 pull does not expose existing user passwords; Entra enterprise-app SCIM
 provisioning is not a channel for exporting users' existing passwords. The
