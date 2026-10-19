@@ -12,6 +12,8 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+from bridge.self_target import ERROR_HEADER
+
 
 correlation_id = ContextVar("traffic_correlation_id", default="")
 logger = logging.getLogger("bridge.traffic")
@@ -19,7 +21,7 @@ _lock = threading.Lock()
 _fields = {
     "method", "path", "status", "scheme", "host", "port", "tls_mode",
     "error", "count", "ldap_result", "content_type", "cf_ray",
-    "upstream_request_id", "parent_id",
+    "upstream_request_id", "parent_id", "reason",
 }
 
 
@@ -56,6 +58,9 @@ def upstream_metadata(headers):
         request_id = headers.get("x-request-id", "")
         if re.fullmatch(r"[a-fA-F0-9]{32}|[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}", request_id):
             metadata["upstream_request_id"] = request_id
+        reason = headers.get(ERROR_HEADER.lower(), "")
+        if reason in {"self_target", "directory_busy", "dry_run", "uniqueness"}:
+            metadata["reason"] = reason
     except Exception:
         pass
     return metadata
@@ -127,15 +132,20 @@ class TrafficMiddleware:
         start = time.perf_counter()
         status = 500
         error = None
+        reason = None
 
         async def response_send(message):
-            nonlocal status
+            nonlocal status, reason
             if message["type"] == "http.response.start":
                 status = message["status"]
                 message["headers"] = [
                     (key, value) for key, value in message.get("headers", [])
                     if key.lower() != b"x-request-id"
                 ] + [(b"x-request-id", request_id.encode("ascii"))]
+                reason = upstream_metadata({
+                    key.decode("latin-1"): value.decode("latin-1")
+                    for key, value in message["headers"]
+                }).get("reason")
             await send(message)
 
         try:
@@ -153,6 +163,8 @@ class TrafficMiddleware:
                 method = scope.get("method", "")
                 method = method if method in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} else "OTHER"
                 metadata = {"method": method, "path": path, "status": status}
+                if reason:
+                    metadata["reason"] = reason
                 if error:
                     metadata["error"] = error
                 for key, value in scope.get("headers", []):

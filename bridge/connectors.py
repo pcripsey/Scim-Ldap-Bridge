@@ -9,6 +9,7 @@ from ldap3.utils.dn import escape_rdn
 
 from bridge.config import DEFAULT_ATTRIBUTE_MAPPINGS
 from bridge.planner import canonical
+from bridge.self_target import CALLER_HEADER, CALLER_ID, ERROR_HEADER, SelfTargetError, check_scim_target
 from bridge.traffic import destination, elapsed, emit, upstream_metadata
 
 
@@ -61,6 +62,7 @@ class TrafficHttpClient(httpx.Client):
             pass
 
     def send(self, request, *args, **kwargs):
+        request.headers[CALLER_HEADER] = CALLER_ID
         started = time.perf_counter()
         try:
             response = super().send(request, *args, **kwargs)
@@ -68,6 +70,9 @@ class TrafficHttpClient(httpx.Client):
             self._record(request, started, error=error)
             raise
         self._record(request, started, response=response)
+        if response.headers.get(ERROR_HEADER) == "self_target":
+            response.close()
+            raise SelfTargetError()
         return response
 
 
@@ -206,6 +211,7 @@ class ScimClient:
     def __init__(self, settings):
         if not settings.scim_url or not settings.scim_token:
             raise ValueError("SCIM endpoint and bearer token are required.")
+        check_scim_target(settings.scim_url)
         self.settings = settings
         self.discovered_attributes = {}
         self.client = TrafficHttpClient(base_url=settings.scim_url.rstrip("/") + "/", timeout=30,

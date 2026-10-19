@@ -8,6 +8,7 @@ services:
     environment:
       BRIDGE_ADMIN_TOKEN: ${BRIDGE_ADMIN_TOKEN:?Set a random BRIDGE_ADMIN_TOKEN of at least 24 characters}
       BRIDGE_SCIM_TOKEN: ${BRIDGE_SCIM_TOKEN:-}
+      BRIDGE_SCIM_SELF_URLS: ${BRIDGE_SCIM_SELF_URLS:-}
       BRIDGE_DATA_DIR: /data
       BRIDGE_LOG_LEVEL: ${BRIDGE_LOG_LEVEL:-INFO}
       BRIDGE_LOG_POLLS: ${BRIDGE_LOG_POLLS:-false}

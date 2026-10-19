@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +7,9 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from bridge.app import create_app
+from bridge.config import Settings
 from bridge.planner import canonical
+from bridge.self_target import ERROR_HEADER
 
 
 ADMIN = "admin-test-token-at-least-24-chars"
@@ -76,6 +79,33 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(response["dry_run"])
         self.assertFalse(response["enabled"])
         self.assertNotIn("ldap_password", response)
+
+    def test_rejects_own_inbound_url_without_saving_or_resetting_inventory(self):
+        self.client.app.state.store.replace_resources("scim", "Users", {"ada": ADA})
+        response = self.client.put("/api/settings", headers=HEADERS,
+                                   json={"scim_url": "http://testserver/scim/v2/"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("remote SCIM provider", response.json()["detail"])
+        self.assertEqual(self.client.app.state.store.settings().scim_url, "")
+        self.assertIsNotNone(self.client.app.state.store.resource("scim", "Users", "ada"))
+        self.assertFalse(self.client.app.state.service.lock.locked())
+
+    def test_saved_self_target_has_actionable_diagnostics_and_can_be_repaired(self):
+        self.client.app.state.store.save_settings(
+            Settings(scim_url="https://public-alias.example/scim/v2", scim_token="synthetic-provider-token"))
+        with patch.dict(os.environ, {"BRIDGE_SCIM_SELF_URLS": "https://public-alias.example/scim/v2"}):
+            with patch("bridge.connectors.TrafficHttpClient") as outbound:
+                for path in ("/api/test/scim", "/api/discovery/scim", "/api/mappings/validate"):
+                    response = self.client.post(path, headers=HEADERS, json={
+                        "attribute_mappings": [item.model_dump() for item in Settings().attribute_mappings],
+                    })
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("remote SCIM provider", response.json()["detail"])
+                outbound.assert_not_called()
+            self.assertEqual(self.client.get("/api/settings", headers=HEADERS).status_code, 200)
+            response = self.client.put("/api/settings", headers=HEADERS,
+                                       json={"scim_url": "https://provider.example/scim/v2"})
+            self.assertEqual(response.status_code, 200)
 
     def test_database_monitoring_requires_admin(self):
         for path in ("resources", "operations", "resource?source=scim&key=ada"):
@@ -195,6 +225,40 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
                                    json={"userName": "ada", "name": {"familyName": "Lovelace"}})
         self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.headers[ERROR_HEADER], "dry_run")
+
+    def test_duplicate_username_has_distinct_diagnostic(self):
+        self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False})
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"ADA": ADA}
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                        json={"userName": "ada", "name": {"familyName": "Lovelace"}})
+            directory.write.assert_not_called()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.headers[ERROR_HEADER], "uniqueness")
+
+    def test_busy_read_and_write_preserve_lock_and_never_touch_ldap(self):
+        service = self.client.app.state.service
+        service.lock.acquire()
+        try:
+            with patch("bridge.app.LdapClient") as connector:
+                responses = [
+                    self.client.get("/scim/v2/Users", headers=SCIM_HEADERS),
+                    self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                     json={"userName": "ada", "name": {"familyName": "Lovelace"}}),
+                ]
+                connector.assert_not_called()
+            for response in responses:
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.headers[ERROR_HEADER], "directory_busy")
+                self.assertEqual(response.json()["status"], "409")
+            self.assertTrue(service.lock.locked())
+        finally:
+            service.lock.release()
+        with patch("bridge.app.LdapClient") as connector:
+            connector.return_value.__enter__.return_value.users.return_value = {}
+            self.assertEqual(self.client.get("/scim/v2/Users", headers=SCIM_HEADERS).status_code, 200)
 
     def test_scim_create_and_patch(self):
         self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False})
