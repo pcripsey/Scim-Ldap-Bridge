@@ -11,7 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from bridge.config import Settings
-from bridge.connectors import LdapClient, ScimClient, from_scim, scim_document
+from bridge.connectors import (
+    LdapClient, ScimClient, filter_inbound, from_scim, inbound_patch_target, scim_document,
+)
 from bridge.schema import Catalog, ENTERPRISE_SCHEMA, USER_SCHEMA
 from bridge.service import BusyError, SyncService
 from bridge.self_target import (
@@ -278,13 +280,17 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             raise HTTPException(404, "User not found.")
         return user
 
-    def validate_user(document):
+    def validate_user(document, filter_fields=True):
+        settings = app.state.store.settings()
+        if filter_fields and settings.ignore_unsupported_fields:
+            document = filter_inbound(document, settings.attribute_mappings)
         if not isinstance(document.get("userName"), str) or not document["userName"].strip():
             raise HTTPException(400, "userName must be a nonempty string.")
-        if "active" in document or "password" in document or "groups" in document:
+        if not settings.ignore_unsupported_fields and (
+                "active" in document or "password" in document or "groups" in document):
             raise HTTPException(400, "Account status, passwords, and group provisioning are not supported by this mapping.")
         try:
-            user = from_scim(document, app.state.store.settings().attribute_mappings)
+            user = from_scim(document, settings.attribute_mappings)
         except (AttributeError, TypeError, KeyError, ValueError):
             raise HTTPException(400, "Invalid SCIM attribute types.") from None
         if not user["familyName"]:
@@ -388,13 +394,36 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
 
         def patch(client, users):
             existing = find_user(users, identifier)
-            mappings = app.state.store.settings().attribute_mappings
+            settings = app.state.store.settings()
+            mappings, ignore = settings.attribute_mappings, settings.ignore_unsupported_fields
             document = resource(existing, mappings, str(request.base_url).rstrip("/"))
+
+            def inbound_value(key, item):
+                # Treat ignored sub-attributes as absent; an empty result means nothing applicable remains.
+                if (key == "name" and isinstance(item, dict)) or (key == "emails" and isinstance(item, list)):
+                    return filter_inbound({key: item}, mappings).get(key)
+                return item
+
+            applied = False
             for operation in operations:
                 if not isinstance(operation, dict) or str(operation.get("op", "")).lower() not in ("add", "replace", "remove"):
                     raise HTTPException(400, "Unsupported patch operation.")
                 path, value = operation.get("path"), operation.get("value")
                 remove = str(operation["op"]).lower() == "remove"
+                if ignore:
+                    if path is not None and not inbound_patch_target(path, mappings):
+                        continue
+                    if path is None and not remove and isinstance(value, dict):
+                        value = {key: inbound_value(key, item) for key, item in value.items()
+                                 if inbound_patch_target(key, mappings)}
+                        value = {key: item for key, item in value.items() if item is not None and item != {}}
+                        if not value:
+                            continue
+                    elif path in ("name", "emails") and not remove:
+                        value = inbound_value(path, value)
+                        if value is None or value == {}:
+                            continue
+                applied = True
                 if path in ("name.givenName", "name.familyName"):
                     document["name"][path.split(".")[1]] = "" if remove else value
                 elif path in ("displayName", "emails", "name"):
@@ -403,7 +432,10 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                     document.update(value)
                 else:
                     raise HTTPException(400, "Only name, displayName, and emails can be patched.")
-            user = validate_user(document)
+            if not applied:
+                # Every operation targeted ignored attributes: a no-op that returns the unchanged resource.
+                return resource(existing, mappings, str(request.base_url).rstrip("/"))
+            user = validate_user(document, filter_fields=False)
             client.write(user, existing)
             return resource(user, mappings, str(request.base_url).rstrip("/"))
         return directory_operation(patch, write=True)

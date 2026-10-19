@@ -1,5 +1,6 @@
 """Directory transports with metadata logs and redacted DEBUG attribute events."""
 
+import re
 import ssl
 import time
 from functools import wraps
@@ -219,6 +220,76 @@ def from_scim(resource, mappings=None):
         assign_mapping(user, mapping.scim_path if hasattr(mapping, "scim_path") else mapping["scim_path"],
                       scim_value(resource, mapping.scim_path if hasattr(mapping, "scim_path") else mapping["scim_path"]))
     return {**user, "_id": resource.get("id"), "_raw": resource}
+
+
+CORE_USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
+# LdapClient.write derives the required sn and default cn from these values in any mapping direction.
+WRITER_DERIVED_PATHS = ("name.familyName", "displayName")
+PATCH_PATH = re.compile(r"(?:urn:[A-Za-z0-9._:-]+:)?[A-Za-z][A-Za-z0-9_$-]*"
+                        r"(?:\[[^\[\]]+\])?(?:\.[A-Za-z][A-Za-z0-9_$-]*)?")
+
+
+def inbound_paths(mappings):
+    """SCIM paths that inbound provisioning can apply to LDAP."""
+    return [mapping.scim_path for mapping in mappings
+            if mapping.direction != "ldap_to_scim" or mapping.scim_path in WRITER_DERIVED_PATHS]
+
+
+def filter_inbound(document, mappings):
+    """Return only the inbound-mapped attributes of a SCIM User document.
+
+    Malformed values on retained paths are copied unchanged so normal type validation still applies.
+    """
+    filtered = {}
+    for path in inbound_paths(mappings):
+        if path == "emails.value":
+            if "emails" in document:
+                emails = document["emails"]
+                filtered["emails"] = ([{key: value for key, value in item.items() if key in ("value", "primary")}
+                                       if isinstance(item, dict) else item for item in emails]
+                                      if isinstance(emails, list) else emails)
+            continue
+        *parents, leaf = mapping_parts(path)
+        source = document
+        for part in parents:
+            source = source.get(part) if isinstance(source, dict) else None
+        if isinstance(source, dict) and leaf in source:
+            target = filtered
+            for part in parents:
+                if not isinstance(target.get(part), dict):
+                    target[part] = {}
+                target = target[part]
+            target[leaf] = source[leaf]
+    schemas = document.get("schemas")
+    if isinstance(schemas, list):
+        filtered["schemas"] = [schema for schema in schemas
+                               if schema == CORE_USER_SCHEMA or (isinstance(schema, str) and schema in filtered)]
+    return filtered
+
+
+def _path_parts(path):
+    parts = mapping_parts(re.sub(r"\[[^\[\]]*\]", "", path))
+    if parts[0].casefold() == CORE_USER_SCHEMA.casefold():
+        parts = parts[1:]
+    return tuple(part.casefold() for part in parts)
+
+
+def inbound_patch_target(path, mappings):
+    """Whether a PATCH path may address an inbound-mapped attribute.
+
+    Malformed paths are treated as targets so that they are rejected rather than ignored.
+    """
+    if not isinstance(path, str) or not PATCH_PATH.fullmatch(path) or path.casefold() == CORE_USER_SCHEMA.casefold():
+        return True
+    target = _path_parts(path)
+    for mapped in inbound_paths(mappings):
+        if mapped.startswith("urn:") and path.casefold() == mapping_parts(mapped)[0].casefold():
+            return True
+        parts = _path_parts(mapped)
+        shorter = min(len(target), len(parts))
+        if target[:shorter] == parts[:shorter]:
+            return True
+    return False
 
 
 def scim_document(user, existing=None, mappings=None):

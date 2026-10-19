@@ -1,14 +1,17 @@
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from bridge.app import create_app
-from bridge.config import Settings
+from bridge.app import create_app, opaque_id
+from bridge.config import DEFAULT_ATTRIBUTE_MAPPINGS, Settings
+from bridge.connectors import LdapClient
 from bridge.planner import canonical
+from bridge.schema import USER_SCHEMA
 from bridge.self_target import ERROR_HEADER
 
 
@@ -274,6 +277,222 @@ class ApiTests(unittest.TestCase):
                                         json={"Operations": [{"op": "replace", "path": "name.givenName", "value": "Augusta"}]})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(directory.write.call_args.args[0]["givenName"], "Augusta")
+
+    def enable_ignore(self, enabled=True, **extra):
+        response = self.client.put("/api/settings", headers=HEADERS,
+                                   json={"dry_run": False, "ignore_unsupported_fields": enabled, **extra})
+        self.assertEqual(response.status_code, 200)
+
+    def test_ignore_unsupported_fields_defaults_off_and_round_trips(self):
+        self.assertFalse(self.client.get("/api/settings", headers=HEADERS).json()["ignore_unsupported_fields"])
+        self.assertFalse(Settings.model_validate({"dry_run": True}).ignore_unsupported_fields)
+        self.client.put("/api/settings", headers=HEADERS, json={"ldap_password": "saved-password"})
+        self.enable_ignore()
+        self.assertTrue(self.client.get("/api/settings", headers=HEADERS).json()["ignore_unsupported_fields"])
+        self.client.__exit__(None, None, None)
+        self.client = TestClient(create_app(self.directory.name, ADMIN, SCIM))
+        self.client.__enter__()
+        settings = self.client.get("/api/settings", headers=HEADERS).json()
+        self.assertTrue(settings["ignore_unsupported_fields"])
+        self.assertTrue(settings["ldap_password_configured"])
+        self.assertNotIn("ldap_password", settings)
+        self.enable_ignore(False)
+        self.assertFalse(self.client.app.state.store.settings().ignore_unsupported_fields)
+        for invalid in ("yes", "true", 1, None):
+            response = self.client.put("/api/settings", headers=HEADERS, json={"ignore_unsupported_fields": invalid})
+            self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.client.app.state.store.settings().ignore_unsupported_fields)
+        self.assertEqual(self.client.put("/api/settings", headers=SCIM_HEADERS,
+                                         json={"ignore_unsupported_fields": True}).status_code, 401)
+
+    def test_legacy_saved_settings_without_ignore_flag_stay_strict(self):
+        store = self.client.app.state.store
+        legacy = Settings().model_dump()
+        legacy.pop("ignore_unsupported_fields")
+        with store.lock:
+            store.db.execute("INSERT OR REPLACE INTO settings VALUES (1, ?)",
+                             (store.cipher.encrypt(json.dumps(legacy).encode()),))
+        self.assertFalse(store.settings().ignore_unsupported_fields)
+        self.assertFalse(self.client.get("/api/settings", headers=HEADERS).json()["ignore_unsupported_fields"])
+
+    def test_strict_mode_still_rejects_unsupported_fields(self):
+        self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False})
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"ada": ADA}
+            for field, value in (("active", True), ("password", "Secret-1"), ("groups", [{"value": "g"}])):
+                for method, url in (("post", "/scim/v2/Users"), ("put", f"/scim/v2/Users/{opaque_id('ada')}")):
+                    response = getattr(self.client, method)(url, headers=SCIM_HEADERS, json={
+                        "userName": "ada", "name": {"familyName": "Lovelace"}, field: value})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("not supported", response.json()["detail"])
+            response = self.client.patch(f"/scim/v2/Users/{opaque_id('ada')}", headers=SCIM_HEADERS,
+                                         json={"Operations": [{"op": "replace", "path": "active", "value": False}]})
+            self.assertEqual(response.status_code, 400)
+            directory.write.assert_not_called()
+
+    def test_ignore_mode_drops_unsupported_fields_on_create(self):
+        self.enable_ignore()
+        enterprise = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {}
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS, json={
+                "schemas": [USER_SCHEMA, enterprise], "externalId": "csuser3167", "id": "client-id",
+                "userName": "csuser3167@example.org", "active": False, "password": "Secret-1",
+                "groups": [{"value": "admins"}], "title": "Engineer", "meta": {"resourceType": "User", "created": "x"},
+                "displayName": "CS Test User", "name": {"familyName": "User", "givenName": "CS", "middleName": "Q"},
+                "emails": [{"value": "cs@example.org", "type": "work", "primary": True}],
+                enterprise: {"department": "R&D"},
+            })
+            self.assertEqual(response.status_code, 201, response.text)
+            written = directory.write.call_args.args[0]
+        body = response.json()
+        for document in (body, written["_raw"]):
+            for field in ("active", "password", "groups", "externalId", "title", enterprise):
+                self.assertNotIn(field, document)
+            self.assertNotIn("middleName", document["name"])
+            self.assertNotIn("type", document["emails"][0])
+        self.assertEqual(body["schemas"], [USER_SCHEMA])
+        self.assertEqual(body["id"], opaque_id("csuser3167@example.org"))
+        self.assertEqual(body["meta"], {"resourceType": "User", "location": body["meta"]["location"]})
+        self.assertEqual((written["userName"], written["givenName"], written["familyName"], written["email"]),
+                         ("csuser3167@example.org", "CS", "User", "cs@example.org"))
+        self.assertNotIn("_mapped", written)
+        client = LdapClient(Settings(ldap_url="ldaps://directory.example.org", ldap_bind_dn="cn=bridge",
+                                     ldap_password="password", ldap_base_dn="dc=example,dc=org"))
+        client.connection = Mock()
+        with patch.object(client, "_add") as add:
+            client.write(written)
+        attributes = {name.casefold() for name in add.call_args.args[2]}
+        self.assertEqual(attributes, {"uid", "givenname", "sn", "displayname", "mail", "cn"})
+
+    def test_ignore_mode_keeps_required_and_type_validation(self):
+        self.enable_ignore()
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {}
+            reported = {"schemas": [USER_SCHEMA], "externalId": "csuser3167", "active": True,
+                        "userName": "csuser3167@example.org", "displayName": "CS Test User 3167",
+                        "meta": {"resourceType": "User"}}
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS, json=reported)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("name.familyName is required", response.json()["detail"])
+            for payload in ({"active": True, "name": {"familyName": "L"}},
+                            {"userName": " ", "name": {"familyName": "L"}},
+                            {"userName": 7, "name": {"familyName": "L"}},
+                            {"userName": "ada", "name": {"familyName": "L"}, "emails": "ada@example.org"}):
+                response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS, json=payload)
+                self.assertEqual(response.status_code, 400, payload)
+            directory.write.assert_not_called()
+
+    def test_ignore_mode_follows_inbound_mapping_direction_and_extensions(self):
+        enterprise = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+        mappings = [*DEFAULT_ATTRIBUTE_MAPPINGS,
+                    {"scim_path": f"{enterprise}:employeeNumber", "ldap_attribute": "employeeNumber"},
+                    {"scim_path": "title", "ldap_attribute": "title", "direction": "ldap_to_scim"}]
+        self.enable_ignore(attribute_mappings=mappings)
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"ada": ADA}
+            response = self.client.put(f"/scim/v2/Users/{opaque_id('ada')}", headers=SCIM_HEADERS, json={
+                "schemas": [USER_SCHEMA, enterprise], "userName": "ada", "active": False,
+                "name": {"familyName": "Lovelace"}, "title": "Countess",
+                enterprise: {"employeeNumber": "42", "department": "Math"}})
+            self.assertEqual(response.status_code, 200, response.text)
+            written = directory.write.call_args.args[0]
+            self.assertEqual(written["_mapped"][f"{enterprise}:employeeNumber"], "42")
+            self.assertEqual(written["_raw"][enterprise], {"employeeNumber": "42"})
+            self.assertNotIn("title", written["_raw"])
+            self.assertNotIn("active", written["_raw"])
+            self.assertEqual(response.json()["schemas"], [USER_SCHEMA, enterprise])
+            response = self.client.put(f"/scim/v2/Users/{opaque_id('ada')}", headers=SCIM_HEADERS, json={
+                "userName": "grace", "name": {"familyName": "Hopper"}, "active": True})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("immutable", response.json()["detail"])
+
+    def test_ignore_mode_patch_mixed_operations(self):
+        self.enable_ignore()
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"ada": ADA}
+            response = self.client.patch(f"/scim/v2/Users/{opaque_id('ada')}", headers=SCIM_HEADERS, json={
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+                    {"op": "Replace", "path": "active", "value": "False"},
+                    {"op": "replace", "path": "name.givenName", "value": "Augusta"},
+                    {"op": "add", "path": "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department",
+                     "value": "Math"},
+                    {"op": "remove", "path": 'groups[value eq "admins"]'},
+                    {"op": "replace", "path": "name.middleName", "value": "King"},
+                    {"op": "replace", "path": "name", "value": {"middleName": "King"}},
+                    {"op": "replace", "value": {"active": False, "password": "Secret-1", "displayName": "Augusta Ada"}},
+                ]})
+            self.assertEqual(response.status_code, 200, response.text)
+            written = directory.write.call_args.args[0]
+        self.assertEqual((written["givenName"], written["familyName"], written["displayName"], written["email"]),
+                         ("Augusta", "Lovelace", "Augusta Ada", "ada@example.org"))
+        body = response.json()
+        for field in ("active", "password", "groups", "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"):
+            self.assertNotIn(field, body)
+            self.assertNotIn(field, written["_raw"])
+        self.assertEqual(body["name"], {"givenName": "Augusta", "familyName": "Lovelace"})
+
+    def test_ignore_mode_all_ignored_patch_is_a_safe_no_op(self):
+        self.enable_ignore()
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"ada": ADA}
+            response = self.client.patch(f"/scim/v2/Users/{opaque_id('ada')}", headers=SCIM_HEADERS, json={
+                "Operations": [{"op": "replace", "path": "active", "value": False},
+                               {"op": "replace", "value": {"active": False, "externalId": "x"}}]})
+            self.assertEqual(response.status_code, 200, response.text)
+            directory.write.assert_not_called()
+        body = response.json()
+        self.assertNotIn("active", body)
+        self.assertEqual((body["userName"], body["name"]["familyName"]), ("ada", "Lovelace"))
+
+    def test_ignore_mode_patch_preserves_security_and_validation_checks(self):
+        self.enable_ignore()
+        identifier = opaque_id("ada")
+        rejected = [
+            {"Operations": []},
+            {"Operations": "replace"},
+            {"Operations": [{"op": "replace", "path": "active", "value": False}] * 51},
+            {"Operations": [{"op": "replace", "path": "active", "value": False}, {"op": "move", "path": "active"}]},
+            {"Operations": [{"op": "replace", "path": "active", "value": False}, "replace"]},
+            {"Operations": [{"op": "replace", "path": "userName", "value": "grace"}]},
+            {"Operations": [{"op": "replace", "value": {"userName": "grace", "active": False}}]},
+            {"Operations": [{"op": "replace", "path": "", "value": "x"}]},
+            {"Operations": [{"op": "replace", "path": "active eq true", "value": "x"}]},
+            {"Operations": [{"op": "replace", "path": 'emails[type eq "work"].value', "value": "a@example.org"}]},
+            {"Operations": [{"op": "replace", "path": "name.familyName", "value": ""}]},
+            {"Operations": [{"op": "replace", "path": "name", "value": ["Lovelace"]}]},
+            {"Operations": [{"op": "replace", "path": "emails", "value": "ada@example.org"}]},
+        ]
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"ada": ADA}
+            for payload in rejected:
+                response = self.client.patch(f"/scim/v2/Users/{identifier}", headers=SCIM_HEADERS, json=payload)
+                self.assertEqual(response.status_code, 400, payload)
+            response = self.client.patch("/scim/v2/Users/missing", headers=SCIM_HEADERS,
+                                         json={"Operations": [{"op": "replace", "path": "active", "value": False}]})
+            self.assertEqual(response.status_code, 404)
+            directory.write.assert_not_called()
+        ignored = {"Operations": [{"op": "replace", "path": "active", "value": False}]}
+        self.assertEqual(self.client.patch(f"/scim/v2/Users/{identifier}", json=ignored).status_code, 401)
+        self.client.put("/api/settings", headers=HEADERS, json={"dry_run": True})
+        with patch("bridge.app.LdapClient") as connector:
+            response = self.client.patch(f"/scim/v2/Users/{identifier}", headers=SCIM_HEADERS, json=ignored)
+            connector.assert_not_called()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.headers[ERROR_HEADER], "dry_run")
+
+    def test_ignore_mode_does_not_advertise_new_capabilities(self):
+        self.enable_ignore()
+        config = self.client.get("/scim/v2/ServiceProviderConfig", headers=SCIM_HEADERS).json()
+        self.assertFalse(config["changePassword"]["supported"])
+        self.assertFalse(config["bulk"]["supported"])
 
     def test_scim_deletion_disabled(self):
         response = self.client.delete("/scim/v2/Users/ada", headers=SCIM_HEADERS)

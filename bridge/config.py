@@ -88,6 +88,7 @@ class Settings(BaseModel):
     interval_seconds: int = Field(default=300, ge=30, le=86400)
     enabled: bool = False
     dry_run: bool = True
+    ignore_unsupported_fields: bool = Field(default=False, strict=True)
 
     @property
     def scim_configured(self):
