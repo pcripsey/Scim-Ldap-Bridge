@@ -88,9 +88,15 @@ async function environment(page: Page, overrides: Partial<Settings> = {}) {
       const source = url.searchParams.get('source') ?? 'scim';
       const resources = Array.from({ length: offset === 0 ? 25 : 1 }, (_, index) => ({
         source, resource_type: url.searchParams.get('resource_type'), resource_key: `user-${index + offset}`,
-        observed_at: '2026-10-16T10:00:00Z', present: index === 1 ? 0 : 1,
+        observed_at: '2026-10-16T10:00:00Z', present: source !== 'inbound' && index !== 1 ? 1 : 0,
+        status: source === 'inbound' ? 'waiting_for_ldap' : index === 1 ? 'absent' : 'present',
+        error: source === 'inbound' && index === 0 ? 'LDAPSocketOpenError' : null,
+        attempts: source === 'inbound' && index === 0 ? 2 : null,
       }));
       await route.fulfill({ json: { resources } }); return;
+    }
+    if (url.pathname === '/api/data/pending' && req.method() === 'DELETE') {
+      await route.fulfill({ json: { discarded: true } }); return;
     }
     if (url.pathname === '/api/data/resource') {
       await route.fulfill({ json: { data: { userName: url.searchParams.get('key'), extensions: { department: 'Engineering' } } } }); return;
@@ -136,14 +142,17 @@ test('LDAP service selection confirms replacement, persists defaults, and highli
   page.once('dialog', dialog => dialog.dismiss());
   await page.getByLabel('LDAP service', { exact: true }).selectOption('active_directory');
   await expect(page.getByLabel('LDAP service', { exact: true })).toHaveValue('generic');
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await expect(page.getByLabel('LDAP attribute 6', { exact: true })).toHaveValue('title');
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
   page.once('dialog', dialog => dialog.accept());
   await page.getByLabel('LDAP service', { exact: true }).selectOption('active_directory');
+  await expect(page.getByText('New accounts are disabled', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await expect(page.getByLabel('LDAP attribute 1', { exact: true })).toHaveValue('sAMAccountName');
   await expect(page.getByLabel('LDAP attribute 6', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Required attributes — Microsoft Active Directory Domain Services' })).toBeVisible();
   await expect(page.getByText('Required by bridge', { exact: true })).toBeVisible();
-  await expect(page.getByText('New accounts are disabled', { exact: false })).toBeVisible();
   await page.getByRole('button', { name: 'Synchronization', exact: true }).click();
   await expect(page.getByLabel('Dry-run mode', { exact: true })).toBeChecked();
   await expect(page.getByLabel('Enable scheduled synchronization')).not.toBeChecked();
@@ -156,10 +165,13 @@ test('LDAP service selection confirms replacement, persists defaults, and highli
   await page.getByRole('button', { name: 'Open console' }).click();
   await page.getByRole('button', { name: 'Connections', exact: true }).click();
   await expect(page.getByLabel('LDAP service', { exact: true })).toHaveValue('active_directory');
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await expect(page.getByLabel('LDAP attribute 1', { exact: true })).toHaveValue('sAMAccountName');
   for (const service of ['openldap', '389ds', 'generic']) {
+    await page.getByRole('button', { name: 'Connections', exact: true }).click();
     page.once('dialog', dialog => dialog.accept());
     await page.getByLabel('LDAP service', { exact: true }).selectOption(service);
+    await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
     await expect(page.getByLabel('LDAP attribute 1', { exact: true })).toHaveValue('uid');
     await expect(page.getByLabel('LDAP attribute 3', { exact: true })).toHaveValue('sn');
   }
@@ -171,6 +183,7 @@ test('legacy settings keep generic LDAP defaults and missing surnames are highli
   await page.getByRole('button', { name: 'Connections', exact: true }).click();
   await expect(page.getByLabel('LDAP service', { exact: true })).toHaveValue('generic');
   await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await page.getByRole('button', { name: 'Remove mapping 3', exact: true }).click();
   await expect(page.getByText('Add a name.familyName mapping:', { exact: false })).toBeVisible();
 });
@@ -204,7 +217,7 @@ test('AD activation is opt-in, confirmed on save, and cleared when switching LDA
 test('authenticates, navigates every page, and never persists the token', async ({ page }) => {
   await environment(page);
   await login(page);
-  for (const name of ['Connections', 'Synchronization', 'Inventory', 'Activity', 'System']) {
+  for (const name of ['Connections', 'Attribute mapping', 'Synchronization', 'Inventory', 'Activity', 'System']) {
     await page.getByRole('button', { name, exact: true }).click();
     await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
   }
@@ -317,8 +330,10 @@ test('Entra preserves, replaces, and clears its secret with provider-aware readi
   await expect(page.getByRole('button', { name: 'Run sync', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Connections', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Test SCIM connection' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Discover SCIM attributes' })).toBeEnabled();
   await expect(page.getByRole('button', { name: 'Validate mappings' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
   await page.getByLabel('Base distinguished name', { exact: true }).fill('ou=changed,dc=example,dc=org');
   page.once('dialog', dialog => dialog.accept());
   await page.getByRole('button', { name: 'Save configuration' }).click();
@@ -335,7 +350,11 @@ test('Entra preserves, replaces, and clears its secret with provider-aware readi
   await page.getByRole('button', { name: 'Save configuration' }).click();
   await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
   expect(env.writes[2]).toHaveProperty('entra_client_secret', '');
-  for (const name of ['Test SCIM connection', 'Discover SCIM attributes', 'Validate mappings', 'Run sync']) {
+  for (const name of ['Test SCIM connection', 'Run sync']) {
+    await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
+  }
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
+  for (const name of ['Discover SCIM attributes', 'Validate mappings']) {
     await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
   }
 });
@@ -374,7 +393,9 @@ test('Entra requires its own saved OAuth secret even when a bearer token exists'
   await login(page);
   await expect(page.getByRole('button', { name: 'Run sync', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Connections', exact: true }).click();
-  for (const name of ['Test SCIM connection', 'Discover SCIM attributes', 'Validate mappings']) {
+  await expect(page.getByRole('button', { name: 'Test SCIM connection', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
+  for (const name of ['Discover SCIM attributes', 'Validate mappings']) {
     await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
   }
 });
@@ -462,7 +483,7 @@ test('connection tests use saved settings and report success and failures', asyn
 test('discovers attributes and saves editable mappings', async ({ page }) => {
   const env = await environment(page);
   await login(page);
-  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await page.getByRole('button', { name: 'Discover SCIM attributes' }).click();
   await expect(page.getByText('employeeNumber', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Discover LDAP attributes' }).click();
@@ -485,7 +506,7 @@ test('discovers attributes and saves editable mappings', async ({ page }) => {
 test('ignoring unsupported fields is an explicit, persisted, reversible choice', async ({ page }) => {
   const env = await environment(page);
   await login(page);
-  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   const checkbox = page.getByRole('checkbox', { name: 'Ignore unsupported or unmapped fields' });
   await expect(checkbox).not.toBeChecked();
   await expect(checkbox).toHaveAccessibleDescription(/active:false does not disable the LDAP account/);
@@ -523,7 +544,7 @@ test('legacy settings without the ignore policy default to strict validation', a
   await page.route('**/api/settings', route => route.request().method() === 'GET'
     ? route.fulfill({ json: legacy }) : route.fallback());
   await login(page);
-  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByRole('button', { name: 'Attribute mapping', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: 'Ignore unsupported or unmapped fields' })).not.toBeChecked();
   await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
   await page.getByRole('button', { name: 'Synchronization', exact: true }).click();
@@ -604,6 +625,22 @@ test('inventory supports filtering, pagination, and attribute inspection', async
   await expect(page.getByRole('dialog')).toHaveCount(0);
 });
 
+test('inventory shows SCIM push users waiting to be synchronised to LDAP', async ({ page }) => {
+  const env = await environment(page);
+  await login(page);
+  await page.getByRole('button', { name: 'Inventory', exact: true }).click();
+  await page.getByLabel('Source', { exact: true }).selectOption('inbound');
+  await page.getByRole('button', { name: 'Apply filters' }).click();
+  await expect(page.getByText('Waiting to be synchronised to LDAP', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('SCIM push', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Last attempt failed (LDAPSocketOpenError) / 2 attempts')).toBeVisible();
+  expect(env.calls).toContain('GET /api/data/resources?resource_type=Users&limit=25&offset=0&source=inbound');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Discard', exact: true }).first().click();
+  await expect(page.getByText('user-0 was discarded from the LDAP queue.')).toBeVisible();
+  expect(env.calls).toContain('DELETE /api/data/pending?key=user-0');
+});
+
 test('inventory fetch failures are visible and retryable', async ({ page }) => {
   await environment(page);
   await login(page);
@@ -646,7 +683,7 @@ test('mobile pages fit without document-level horizontal overflow', async ({ pag
   await page.setViewportSize({ width: 390, height: 844 });
   await environment(page);
   await login(page);
-  for (const name of ['Overview', 'Connections', 'Synchronization', 'Inventory', 'Activity', 'System']) {
+  for (const name of ['Overview', 'Connections', 'Attribute mapping', 'Synchronization', 'Inventory', 'Activity', 'System']) {
     await page.getByRole('button', { name, exact: true }).click();
     await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);

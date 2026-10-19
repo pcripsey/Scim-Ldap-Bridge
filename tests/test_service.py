@@ -86,6 +86,23 @@ class ServiceDatabaseTests(unittest.TestCase):
         self.assertEqual(self.store.rows("runs")[0]["status"], "failed")
         self.assertIn("remote SCIM provider", self.store.rows("events")[0]["message"])
 
+    def test_queued_users_wait_for_live_mode_and_reachable_ldap(self):
+        self.store.add_pending({**ADA, "_raw": {}})
+        live = Settings(dry_run=False, ldap_url="ldaps://directory.example.org", ldap_bind_dn="cn=bridge",
+                        ldap_password="bind-secret", ldap_base_dn="dc=example,dc=org")
+        with patch("bridge.service.LdapClient") as ldap:
+            self.store.save_settings(live.model_copy(update={"dry_run": True}))
+            self.assertIsNone(self.service.drain_pending())
+            ldap.assert_not_called()
+            self.store.save_settings(live)
+            ldap.return_value.__enter__.side_effect = ConnectionError("synthetic")
+            self.assertIsNone(self.service.drain_pending())
+        self.assertFalse(self.service.lock.locked())
+        record = self.store.resource_records(source="inbound")[0]
+        self.assertEqual((record["status"], record["error"], record["attempts"]),
+                         ("waiting_for_ldap", "ConnectionError", 1))
+        self.assertEqual(self.store.pending_user("ada")["familyName"], "Lovelace")
+
 
 if __name__ == "__main__":
     unittest.main()

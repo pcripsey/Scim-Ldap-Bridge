@@ -253,12 +253,15 @@ The responsive React/TypeScript console includes:
   and LDAP service selection, URL, bind credentials, base DN, and StartTLS.
   Test saved connectors before syncing. Saved credentials are never returned;
   explicitly choose to replace or clear them, otherwise they remain unchanged.
-- **Attribute mapping** (on Connections): SCIM-to-LDAP mappings and the opt-in
-  **Ignore unsupported or unmapped fields** policy for inbound provisioning.
+- **Attribute mapping:** a dedicated page for SCIM-to-LDAP mappings, attribute
+  discovery, validation and preview, and the opt-in **Ignore unsupported or
+  unmapped fields** policy for inbound provisioning.
 - **Synchronization:** direction, conflict policy, dry-run/live mode, automatic
   scheduling, interval (30-86,400 seconds), and manual runs.
 - **Inventory:** paginated, source/type-filtered cached resources, presence state,
-  and a read-only decrypted attribute inspector.
+  and a read-only decrypted attribute inspector. Users received through inbound
+  SCIM push that are not yet in LDAP are listed with source **SCIM push** and
+  status **Waiting to be synchronised to LDAP**, and can be discarded.
 - **Activity:** recent runs, paginated operation history, and recent events.
 - **System:** inbound SCIM availability, deployment settings, and backup guidance.
 
@@ -316,7 +319,7 @@ The Docker named volume `bridge-data` contains:
 
 | File | Purpose |
 | --- | --- |
-| `/data/bridge.db` | Configuration, resource inventory, sync baselines, operations, runs, and events |
+| `/data/bridge.db` | Configuration, resource inventory, queued inbound users, sync baselines, operations, runs, and events |
 | `/data/bridge.db-wal`, `/data/bridge.db-shm` | SQLite write-ahead logging files, when present |
 | `/data/encryption.key` | Key required to decrypt stored configuration and resource data |
 
@@ -339,6 +342,22 @@ marked absent, not deleted from the cache. Changing a connector's identity clear
 inventory and baselines. Operations follow the most recent 200 runs; event history
 is capped at 2,000 entries. The inventory is the latest observed state, not a full
 historical archive or the authoritative directory.
+
+### Queued inbound SCIM users
+
+An inbound SCIM `POST /scim/v2/Users` is validated and then stored, encrypted, in
+the database **before** the bridge attempts to create it in LDAP. When LDAP accepts
+the user it is removed from the queue and the LDAP inventory is refreshed. If dry
+run is enabled, another directory operation is running, or LDAP is unreachable or
+rejects the write, the request still returns `201 Created` and the user remains
+queued with status `waiting_for_ldap` (plus the last error type and attempt count).
+While live mode is on, the service retries queued users every 30 seconds. Queued
+users are returned by inbound SCIM reads and can be updated with `PUT`/`PATCH`
+until they are created. A queued user whose `userName` already exists in LDAP is
+marked `conflict` and is not retried or overwritten; review it and discard it from
+Inventory (`DELETE /api/data/pending?key=<userName>`). Queued users are kept when
+connector settings change and are written to the LDAP directory configured when
+they are retried.
 
 ### Persistence And Backups
 
@@ -530,8 +549,10 @@ Provisioning credentials cannot access management data.
 | `GET /api/data/resources` | Paginated resource metadata, without payloads |
 | `GET /api/data/resource?source=scim&key=ada` | Read an authorized resource's decrypted attributes |
 | `GET /api/data/operations` | Paginated operation history, without write payloads |
+| `DELETE /api/data/pending?key=ada` | Discard a queued inbound user that has not been created in LDAP |
 
-Inventory accepts `source=scim` or `source=ldap`, `resource_type` (default `Users`),
+Inventory accepts `source=scim`, `source=ldap`, or `source=inbound` (queued inbound
+users waiting for LDAP), `resource_type` (default `Users`),
 `limit` (1-1,000), and `offset`. Operation history accepts `limit` and `offset`.
 The storage model can hold users, groups, and arbitrary JSON resource types;
 the current synchronization connectors populate users only.
@@ -551,10 +572,11 @@ The inbound SCIM 2.0 User service exposes `/ServiceProviderConfig`, `/Schemas`,
 `/ResourceTypes`, and User list/read/create/replace/patch endpoints under `/scim/v2`.
 It supports SCIM filter expressions provided by the schema filter library, with
 pagination capped at 1,000 results per page. User responses include `meta.resourceType`
-and `meta.location`. Inbound writes are blocked during dry runs. The advertised feature
+and `meta.location`. During dry runs, inbound creates are queued in the database
+instead of being written to LDAP, and updates to existing LDAP users are blocked. The advertised feature
 set intentionally excludes bulk, sorting, ETags, and password changes.
 
-The console's **Attribute mapping** section can discover SCIM schemas/resource types,
+The console's **Attribute mapping** page can discover SCIM schemas/resource types,
 attribute type/multiplicity metadata when the SCIM schema provides it, and LDAP
 attribute names and samples (LDAP type/multiplicity is reported as unavailable).
 Sensitive-looking attributes are excluded. Map SCIM paths to LDAP attributes with
