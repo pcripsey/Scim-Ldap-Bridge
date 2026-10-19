@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -15,6 +15,7 @@ from bridge.connectors import LdapClient, ScimClient, from_scim, scim_document
 from bridge.schema import Catalog, ENTERPRISE_SCHEMA, USER_SCHEMA
 from bridge.service import BusyError, SyncService
 from bridge.store import Store
+from bridge.traffic import TrafficMiddleware, configure_logging
 
 
 SCIM_LIST = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
@@ -36,6 +37,7 @@ def resource(user, mappings=None, base_url=""):
 
 
 def create_app(data_dir=None, admin_token=None, scim_token=None):
+    configure_logging()
     @asynccontextmanager
     async def lifespan(app):
         token = admin_token or os.environ.get("BRIDGE_ADMIN_TOKEN", "")
@@ -92,6 +94,13 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         if request.url.path.startswith(("/api/", "/scim/")):
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    app.add_middleware(TrafficMiddleware)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request, error):
+        return PlainTextResponse("Internal Server Error", status_code=500,
+                                 headers={"X-Request-ID": request.scope.get("traffic_request_id", "")})
 
     @app.get("/healthz")
     def health():

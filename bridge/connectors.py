@@ -1,4 +1,6 @@
 import ssl
+import time
+from functools import wraps
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -7,9 +9,84 @@ from ldap3.utils.dn import escape_rdn
 
 from bridge.config import DEFAULT_ATTRIBUTE_MAPPINGS
 from bridge.planner import canonical
+from bridge.traffic import destination, elapsed, emit, upstream_metadata
 
 
 MAX_USERS = 10000
+
+
+def _error_type(error):
+    name = type(error).__name__
+    return name if name in {
+        "ValueError", "TypeError", "RuntimeError", "OSError", "TimeoutError",
+        "ConnectError", "ReadError", "WriteError", "RemoteProtocolError",
+        "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+        "LDAPBindError", "LDAPSocketOpenError", "LDAPSocketReceiveError",
+        "LDAPSocketSendError", "LDAPStartTLSError", "LDAPInvalidCredentialsResult",
+        "LDAPInsufficientAccessRightsResult", "LDAPNoSuchObjectResult",
+    } else "Exception"
+
+
+def _http_result(status):
+    if 200 <= status < 300:
+        return "success"
+    return {401: "unauthorized", 403: "forbidden", 404: "not_found",
+            408: "timeout", 409: "conflict", 429: "rate_limited"}.get(
+                status, "upstream_error" if status >= 500 else
+                "redirect" if 300 <= status < 400 else "client_error")
+
+
+class TrafficHttpClient(httpx.Client):
+    def _record(self, request, started, response=None, error=None):
+        try:
+            path = request.url.raw_path.split(b"?", 1)[0]
+            prefix = self.base_url.raw_path.split(b"?", 1)[0].rstrip(b"/") + b"/"
+            relative = path[len(prefix):] if path.startswith(prefix) else b""
+            route = ("/" + relative.decode("ascii") if relative in {b"Users", b"Schemas", b"ResourceTypes"}
+                     else "/Users/{id}" if relative.startswith(b"Users/") and relative[6:]
+                     and b"/" not in relative[6:] else "/<redacted>")
+            method = request.method if request.method in {
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+            } else "OTHER"
+            metadata = {**destination(str(request.url)), "method": method, "path": route}
+            if error is not None:
+                metadata["error"] = _error_type(error)
+                result = "timeout" if isinstance(error, httpx.TimeoutException) else "transport_error"
+            else:
+                metadata["status"] = response.status_code
+                metadata.update(upstream_metadata(response.headers))
+                result = _http_result(response.status_code)
+            emit("outbound", "scim", "request", result, elapsed(started), **metadata)
+        except Exception:
+            pass
+
+    def send(self, request, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            response = super().send(request, *args, **kwargs)
+        except Exception as error:
+            self._record(request, started, error=error)
+            raise
+        self._record(request, started, response=response)
+        return response
+
+
+def _ldap_operation(operation):
+    def decorate(function):
+        @wraps(function)
+        def logged(self, *args, **kwargs):
+            started = time.perf_counter()
+            if operation == "search":
+                self._traffic_entry_count = 0
+            try:
+                result = function(self, *args, **kwargs)
+            except Exception as error:
+                self._record(operation, started, error=error)
+                raise
+            self._record(operation, started, failed=result is False)
+            return result
+        return logged
+    return decorate
 
 
 def index_users(users):
@@ -131,7 +208,7 @@ class ScimClient:
             raise ValueError("SCIM endpoint and bearer token are required.")
         self.settings = settings
         self.discovered_attributes = {}
-        self.client = httpx.Client(base_url=settings.scim_url.rstrip("/") + "/", timeout=30,
+        self.client = TrafficHttpClient(base_url=settings.scim_url.rstrip("/") + "/", timeout=30,
                                    headers={"Authorization": f"Bearer {settings.scim_token}",
                                             "Accept": "application/scim+json",
                                             "Content-Type": "application/scim+json"})
@@ -227,6 +304,45 @@ class LdapClient:
         self.connection = None
         self.discovered_attributes = {}
 
+    def _record(self, operation, started, error=None, failed=False):
+        try:
+            secure = urlparse(self.settings.ldap_url).scheme == "ldaps"
+            metadata = {
+                **destination(self.settings.ldap_url, default_port=636 if secure else 389),
+                "tls_mode": "ldaps" if secure else "starttls" if self.settings.ldap_start_tls else "plain",
+            }
+            if operation == "connect_starttls_bind" and metadata["tls_mode"] != "starttls":
+                operation = "connect_bind"
+            if operation == "search":
+                metadata["count"] = self._traffic_entry_count
+            result = "success"
+            code = None
+            if self.connection is not None:
+                raw = self.connection.result
+                code = raw.get("result") if isinstance(raw, dict) else None
+            if error is not None:
+                try:
+                    error_code = getattr(error, "result", None)
+                    if type(error_code) is int and 0 <= error_code <= 4096:
+                        code = error_code
+                except Exception:
+                    pass
+            if type(code) is int and 0 <= code <= 4096:
+                metadata["ldap_result"] = code
+                if code:
+                    result = {32: "not_found", 49: "unauthorized", 50: "forbidden",
+                              51: "unavailable", 52: "unavailable"}.get(code, "ldap_error")
+            if error is not None:
+                metadata["error"] = _error_type(error)
+                if result == "success":
+                    result = "error"
+            elif failed and result == "success":
+                result = "ldap_error"
+            emit("outbound", "ldap", operation, result, elapsed(started), **metadata)
+        except Exception:
+            pass
+
+    @_ldap_operation("connect_starttls_bind")
     def __enter__(self):
         parsed = urlparse(self.settings.ldap_url)
         secure = parsed.scheme == "ldaps"
@@ -243,8 +359,17 @@ class LdapClient:
 
     def __exit__(self, *args):
         if self.connection:
-            self.connection.unbind()
+            try:
+                self._unbind()
+            except Exception:
+                if not args or args[0] is None:
+                    raise
 
+    @_ldap_operation("unbind")
+    def _unbind(self):
+        return self.connection.unbind()
+
+    @_ldap_operation("search")
     def users(self):
         users = []
         entries = self.connection.extend.standard.paged_search(
@@ -253,6 +378,7 @@ class LdapClient:
         for entry in entries:
             if entry["type"] != "searchResEntry":
                 continue
+            self._traffic_entry_count += 1
             attrs = entry["attributes"]
             for name, value in attrs.items():
                 if not sensitive_attribute(name):
@@ -282,6 +408,7 @@ class LdapClient:
             raise ValueError("Incomplete LDAP search; reconciliation stopped.")
         return index_users(users)
 
+    @_ldap_operation("search")
     def discovery(self):
         entries = self.connection.extend.standard.paged_search(
             self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
@@ -290,6 +417,7 @@ class LdapClient:
         for entry in entries:
             if entry["type"] != "searchResEntry":
                 continue
+            self._traffic_entry_count += 1
             count += 1
             for name, value in entry["attributes"].items():
                 if not sensitive_attribute(name):
@@ -323,13 +451,21 @@ class LdapClient:
         attrs.setdefault("sn", [user["familyName"]])
         if existing:
             changes = {field: [(MODIFY_REPLACE, value)] for field, value in attrs.items()}
-            self.connection.modify(existing["_dn"], changes)
+            self._modify(existing["_dn"], changes)
         else:
             username_attribute = next(mapping.ldap_attribute for mapping in self.settings.attribute_mappings
                                       if mapping.scim_path == "userName")
             dn = f"{username_attribute}={escape_rdn(username)},{self.settings.ldap_base_dn}"
-            self.connection.add(dn, ["top", "person", "organizationalPerson", "inetOrgPerson"],
-                                {**attrs, username_attribute: [username]})
+            self._add(dn, ["top", "person", "organizationalPerson", "inetOrgPerson"],
+                      {**attrs, username_attribute: [username]})
+
+    @_ldap_operation("modify")
+    def _modify(self, *args):
+        return self.connection.modify(*args)
+
+    @_ldap_operation("add")
+    def _add(self, *args):
+        return self.connection.add(*args)
 
 
 def sensitive_attribute(name):
