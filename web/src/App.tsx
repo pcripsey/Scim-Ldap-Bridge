@@ -5,7 +5,7 @@ import {
   Play, RefreshCw, Save, Server, Settings2, ShieldCheck, X,
 } from 'lucide-react';
 import {
-  ApiError, message, request, settingsPayload,
+  ApiError, message, normalizeSettings, request, settingsPayload,
   type AttributeDiscovery, type Event, type MappingValidation, type Operation, type Resource, type Run, type SecretEdit,
   type Secrets, type Settings, type Status,
 } from './api';
@@ -21,7 +21,21 @@ const navigation = [
 ] as const;
 const emptySecrets = (): Secrets => ({
   scim_token: { mode: 'keep', value: '' }, ldap_password: { mode: 'keep', value: '' },
+  entra_client_secret: { mode: 'keep', value: '' },
 });
+const entraUrl = 'https://graph.microsoft.com/rp/scim';
+const guidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
+function validEntraFilter(value: string) {
+  if (!value) return true;
+  if (value.length > 2048) return false;
+  const match = /^(?:(userName|id|externalId|groups\.value|active) eq (.+)|userName ew (.+))$/.exec(value);
+  if (!match || match[0] !== value) return false;
+  if (match[1] === 'active') return /^(true|false)$/i.test(match[2]);
+  try {
+    const operand: unknown = JSON.parse(match[2] ?? match[3]);
+    return typeof operand === 'string' && operand.length > 0 && !Array.from(operand).some(char => char.charCodeAt(0) < 32);
+  } catch { return false; }
+}
 const date = (value: string | number | null) =>
   value === null ? 'Not scheduled' : new Date(typeof value === 'number' ? value * 1000 : value).toLocaleString();
 const direction = { bidirectional: 'Bidirectional', scim_to_ldap: 'SCIM to LDAP', ldap_to_scim: 'LDAP to SCIM' };
@@ -114,7 +128,7 @@ export function App() {
       const [status, settings] = await Promise.all([
         request<Status>(token, '/api/status'), request<Settings>(token, '/api/settings'),
       ]);
-      setSession({ token, status, settings }); setToken('');
+      setSession({ token, status, settings: normalizeSettings(settings) }); setToken('');
     } catch (error) { setError(message(error)); }
     finally { setBusy(false); }
   }
@@ -155,8 +169,15 @@ function Console({ session, onLogout }: {
   const dirty = JSON.stringify(draft) !== JSON.stringify(saved) ||
     Object.values(secrets).some(secret => secret.mode !== 'keep');
   const currentPage = navigation.find(item => item.name === page)!;
-  const connected = Boolean(saved.scim_url && saved.ldap_url && saved.ldap_base_dn &&
-    saved.ldap_bind_dn && saved.scim_token_configured && saved.ldap_password_configured);
+  const entra = draft.scim_provider === 'entra';
+  const scimReady = Boolean(saved.scim_url && (saved.scim_provider === 'entra'
+    ? new RegExp(`^${guidPattern}$`).test(saved.entra_tenant_id) &&
+      new RegExp(`^${guidPattern}$`).test(saved.entra_client_id) && saved.entra_client_secret_configured &&
+      /^https:\/\/graph\.microsoft\.com\/rp\/scim\/?$/.test(saved.scim_url) && saved.direction === 'scim_to_ldap' &&
+      validEntraFilter(saved.scim_filter)
+    : saved.scim_token_configured));
+  const connected = Boolean(scimReady && saved.ldap_url && saved.ldap_base_dn &&
+    saved.ldap_bind_dn && saved.ldap_password_configured);
 
   const api = useCallback(async <T,>(path: string, init?: RequestInit): Promise<T> => {
     try { return await request<T>(session.token, path, init); }
@@ -206,11 +227,41 @@ function Console({ session, onLogout }: {
     setDraft(previous => ({ ...previous, [key]: value }));
   }
 
+  function selectProvider(provider: Settings['scim_provider']) {
+    if (provider === draft.scim_provider) return;
+    setDraft(previous => ({
+      ...previous, scim_provider: provider, enabled: false, dry_run: true,
+      ...(provider === 'entra'
+        ? { scim_url: entraUrl, direction: 'scim_to_ldap' as const }
+        : { scim_url: saved.scim_provider === 'generic' ? saved.scim_url : '', scim_filter: '' }),
+    }));
+    setSecrets(previous => ({
+      ...previous,
+      scim_token: previous.scim_token.mode === 'replace' ? { mode: 'keep', value: '' } : previous.scim_token,
+      entra_client_secret: previous.entra_client_secret.mode === 'replace' ? { mode: 'keep', value: '' } : previous.entra_client_secret,
+    }));
+    setDiscovery({}); setShowMappingPreview(false);
+  }
+
   const plainLdap = draft.ldap_url.toLowerCase().startsWith('ldap://') ? true
     : draft.ldap_url.toLowerCase().startsWith('ldaps://') ? false : undefined;
 
   function save(event: FormEvent) {
     event.preventDefault();
+    if (Object.values(secrets).some(secret => secret.mode === 'replace' && !secret.value)) {
+      setNotice({ text: 'Enter a value for each credential being replaced.', kind: 'error' });
+      return;
+    }
+    if (entra && (!new RegExp(`^${guidPattern}$`).test(draft.entra_tenant_id) ||
+        !new RegExp(`^${guidPattern}$`).test(draft.entra_client_id) || draft.direction !== 'scim_to_ldap' ||
+        !/^https:\/\/graph\.microsoft\.com\/rp\/scim\/?$/.test(draft.scim_url))) {
+      setNotice({ text: 'Entra requires GUID tenant and client IDs, the official Graph SCIM endpoint, and SCIM to LDAP direction.', kind: 'error' });
+      return;
+    }
+    if (entra && !validEntraFilter(draft.scim_filter)) {
+      setNotice({ text: 'Invalid Entra source filter. Use one predicate: userName/id/externalId/groups.value eq "value", userName ew "suffix", or active eq true/false. Compound and not filters are not supported.', kind: 'error' });
+      return;
+    }
     const paths = draft.attribute_mappings.map(mapping => mapping.scim_path.trim().toLowerCase());
     const attributes = draft.attribute_mappings.map(mapping => mapping.ldap_attribute.trim().toLowerCase());
     if (paths.some(path => !path) || attributes.some(attribute => !attribute) ||
@@ -220,11 +271,15 @@ function Console({ session, onLogout }: {
       return;
     }
     const warnings: string[] = [];
+    const scopeChanged = (['scim_provider', 'entra_tenant_id', 'entra_client_id', 'scim_filter'] as const)
+      .some(key => draft[key] !== saved[key]);
     if (!draft.dry_run && (saved.dry_run || (!saved.enabled && draft.enabled))) {
       warnings.push('Live mode allows writes to your directories, including inbound SCIM provisioning. Enabling the schedule will run automatically.');
     }
-    if ((['scim_url', 'ldap_url', 'ldap_base_dn', 'ldap_bind_dn'] as const).some(key => draft[key] !== saved[key])) {
-      warnings.push('Changing connector identity clears cached inventory and identity baselines.');
+    if (scopeChanged || (['scim_url', 'ldap_url', 'ldap_base_dn', 'ldap_bind_dn'] as const).some(key => draft[key] !== saved[key])) {
+      warnings.push('Changing source scope or connector identity clears cached inventory and identity baselines. Confirm the provider, endpoint, tenant, client, and source filter identify the intended source before continuing.');
+      warnings.push(`Source: ${draft.scim_provider}\nEndpoint: ${draft.scim_url || '(unset)'}${entra
+        ? `\nTenant: ${draft.entra_tenant_id}\nClient: ${draft.entra_client_id}\nSource filter: ${draft.scim_filter || '(all users)'}` : ''}`);
     }
     if (Object.values(secrets).some(secret => secret.mode === 'clear')) warnings.push('Selected saved credentials will be removed.');
     if (plainLdap && !draft.ldap_start_tls && draft.ldap_allow_insecure && !(saved.ldap_allow_insecure && !saved.ldap_start_tls)) {
@@ -232,12 +287,14 @@ function Console({ session, onLogout }: {
     }
     if (warnings.length && !window.confirm(`${warnings.join('\n\n')}\n\nSave these settings?`)) return;
     void action('save', async () => {
-      await api('/api/settings', { method: 'PUT', body: JSON.stringify(settingsPayload(draft, secrets)) });
+      await api('/api/settings', { method: 'PUT', body: JSON.stringify({
+        ...settingsPayload(draft, secrets), ...(scopeChanged ? { confirm_scope_reset: true } : {}),
+      }) });
       // The saved response is authoritative, including whether credentials are configured.
       let latest: Settings;
-      try { latest = await api<Settings>('/api/settings'); }
+      try { latest = normalizeSettings(await api<Settings>('/api/settings')); }
       catch (error) { throw new Error(`Configuration was saved, but could not be reloaded: ${message(error)}. Sign out and reconnect to reload saved settings.`); }
-      setSaved(latest); setDraft(latest); setSecrets(emptySecrets());
+      setSaved(latest); setDraft(latest); setSecrets(emptySecrets()); setDiscovery({}); setShowMappingPreview(false);
       return 'Configuration saved. Your next run will use these settings.';
     });
   }
@@ -314,7 +371,7 @@ function Console({ session, onLogout }: {
         <Metric label="SYNC STATUS" value={status.running ? 'Running' : 'Idle'} icon={<Activity />} note={status.enabled ? `Next: ${date(status.next_run)}` : 'Automatic schedule paused'} />
       </div>
       <div className="two-columns"><Panel title="Your connections" subtitle="The two sides of your identity bridge" action={<button className="text-button" onClick={() => setPage('Connections')}>Configure <ArrowRight size={15} /></button>}>
-        <ConnectionSummary name="SCIM provider" endpoint={saved.scim_url} ready={Boolean(saved.scim_url && saved.scim_token_configured)} icon={<Network />} />
+        <ConnectionSummary name="SCIM provider" endpoint={saved.scim_url} ready={scimReady} icon={<Network />} />
         <div className="connection-link"><span /><ArrowDownUp size={16} /><span /></div>
         <ConnectionSummary name="LDAP directory" endpoint={saved.ldap_url} ready={Boolean(saved.ldap_url && saved.ldap_base_dn && saved.ldap_bind_dn && saved.ldap_password_configured)} icon={<Database />} />
         <p className="panel-footnote">Configured does not mean verified. Test each saved connection before syncing.</p>
@@ -334,9 +391,18 @@ function Console({ session, onLogout }: {
         <Notice kind="info">Credentials are encrypted at rest. Leave a credential unchanged to keep its saved value. Changing an endpoint or LDAP identity resets inventory and baselines.</Notice>
         <div className="two-columns connection-forms">
           <Panel title="SCIM provider" subtitle="Your remote SCIM 2.0 API" action={<span className="section-icon"><Network size={20} /></span>}>
-            <Field label="SCIM endpoint URL" hint="Include the base API path, for example https://identity.example.org/scim/v2. Use HTTPS outside isolated development."><input type="url" placeholder="https://identity.example.org/scim/v2" value={draft.scim_url} onChange={event => update('scim_url', event.target.value)} /></Field>
-            <SecretField label="SCIM bearer token" configured={saved.scim_token_configured} edit={secrets.scim_token} onChange={edit => setSecrets(previous => ({ ...previous, scim_token: edit }))} />
-            <div className="test-row"><button type="button" disabled={dirty || !saved.scim_url || !saved.scim_token_configured} onClick={() => test('scim')}><Network size={16} />{busy === 'test-scim' ? 'Testing...' : 'Test SCIM connection'}</button></div>
+            <Field label="Provider and authentication"><select value={draft.scim_provider} onChange={event => {
+              if (event.target.value === 'generic' || event.target.value === 'entra') selectProvider(event.target.value);
+            }}><option value="generic">Generic SCIM — static bearer token</option><option value="entra">Microsoft Entra pull — OAuth client secret</option></select></Field>
+            {entra && <Notice kind="warning">Opt-in Entra pull reads users into LDAP only. Switching providers pauses the schedule and enables dry run. Verify your tenant, application, and source scope before saving. Direct group membership filtering is supported, but group provisioning, deletion, and deactivation are not. Grant application permissions User.Read.All and Group.Read.All with administrator consent.</Notice>}
+            <Field label="SCIM endpoint URL" hint={entra ? 'Official Microsoft Graph SCIM endpoint. This URL cannot be changed in Entra mode.' : 'Include the base API path, for example https://identity.example.org/scim/v2. Use HTTPS outside isolated development.'}><input type="url" required={entra} readOnly={entra} placeholder="https://identity.example.org/scim/v2" value={draft.scim_url} onChange={event => update('scim_url', event.target.value)} /></Field>
+            {entra ? <>
+              <Field label="Entra tenant ID" hint="Directory (tenant) ID, in GUID format."><input required pattern={guidPattern} value={draft.entra_tenant_id} onChange={event => update('entra_tenant_id', event.target.value)} /></Field>
+              <Field label="Entra client ID" hint="Application (client) ID, in GUID format."><input required pattern={guidPattern} value={draft.entra_client_id} onChange={event => update('entra_client_id', event.target.value)} /></Field>
+              <SecretField label="Entra client secret" configured={saved.entra_client_secret_configured} edit={secrets.entra_client_secret} onChange={edit => setSecrets(previous => ({ ...previous, entra_client_secret: edit }))} />
+              <Field label="Entra source filter" hint={'Optional single predicate: userName, id, externalId, or groups.value eq a JSON-quoted string; active eq true/false; or userName ew a JSON-quoted suffix. Examples: active eq true or userName ew "@example.org". groups.value eq "group-id" selects direct members only, not transitive membership. No compound/not filters, group provisioning, deletion, or deactivation.'}><input maxLength={2048} value={draft.scim_filter} onChange={event => update('scim_filter', event.target.value)} /></Field>
+            </> : <SecretField label="SCIM bearer token" configured={saved.scim_token_configured} edit={secrets.scim_token} onChange={edit => setSecrets(previous => ({ ...previous, scim_token: edit }))} />}
+            <div className="test-row"><button type="button" disabled={dirty || !scimReady} onClick={() => test('scim')}><Network size={16} />{busy === 'test-scim' ? 'Testing...' : 'Test SCIM connection'}</button></div>
           </Panel>
           <Panel title="LDAP directory" subtitle="A certificate-verified directory connection" action={<span className="section-icon"><Database size={20} /></span>}>
             <Field label="LDAP endpoint URL" hint="Use ldaps:// (port 636, implicit TLS) or ldap:// (port 389) with StartTLS. The server must trust the directory certificate."><input type="url" placeholder="ldaps://directory.example.org:636" value={draft.ldap_url} onChange={event => update('ldap_url', event.target.value)} /></Field>
@@ -352,7 +418,7 @@ function Console({ session, onLogout }: {
         <Panel title="Attribute mapping" subtitle="Map SCIM paths to LDAP attributes. Discovery uses saved, read-only connections.">
           <p className="body-copy">The userName mapping identifies accounts. Passwords and other sensitive attributes are excluded from discovery. Validation uses saved connector settings.</p>
           <div className="button-row mapping-discovery">
-            <button type="button" disabled={dirty || !saved.scim_url || !saved.scim_token_configured || Boolean(busy)}
+            <button type="button" disabled={dirty || !scimReady || Boolean(busy)}
               onClick={() => discover('scim')}>{busy === 'discover-scim' ? 'Discovering SCIM...' : 'Discover SCIM attributes'}</button>
             <button type="button" disabled={dirty || !saved.ldap_url || !saved.ldap_base_dn || !saved.ldap_bind_dn || !saved.ldap_password_configured || Boolean(busy)}
               onClick={() => discover('ldap')}>{busy === 'discover-ldap' ? 'Discovering LDAP...' : 'Discover LDAP attributes'}</button>
@@ -378,7 +444,7 @@ function Console({ session, onLogout }: {
           <datalist id="scim-attribute-options">{(discovery.scim?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <datalist id="ldap-attribute-options">{(discovery.ldap?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <div className="button-row mapping-discovery"><button type="button" onClick={() => update('attribute_mappings', [...draft.attribute_mappings, { scim_path: '', ldap_attribute: '', direction: 'both' }])}>Add mapping</button></div>
-          <div className="button-row mapping-discovery"><button type="button" disabled={!saved.scim_url || !saved.scim_token_configured || !saved.ldap_url || !saved.ldap_base_dn || !saved.ldap_bind_dn || !saved.ldap_password_configured || Boolean(busy)}
+          <div className="button-row mapping-discovery"><button type="button" disabled={!connected || Boolean(busy)}
             onClick={validateMappings}>{busy === 'validate-mappings' ? 'Validating...' : 'Validate mappings'}</button></div>
           <div className="button-row mapping-discovery"><button type="button" disabled={!discovery.scim || !discovery.ldap}
             onClick={() => setShowMappingPreview(value => !value)}>{showMappingPreview ? 'Hide mapping preview' : 'Preview mapping'}</button></div>
@@ -405,8 +471,8 @@ function Console({ session, onLogout }: {
         <div className="two-columns"><Panel title="Reconciliation policy" subtitle="Choose the source of truth for your identities">
           <Field label="Synchronization direction"><select value={draft.direction} onChange={event => {
             const value = event.target.value;
-            if (value === 'bidirectional' || value === 'scim_to_ldap' || value === 'ldap_to_scim') update('direction', value);
-          }}><option value="bidirectional">Bidirectional</option><option value="scim_to_ldap">SCIM to LDAP</option><option value="ldap_to_scim">LDAP to SCIM</option></select></Field>
+            if (value === 'scim_to_ldap' || (!entra && (value === 'bidirectional' || value === 'ldap_to_scim'))) update('direction', value);
+          }}><option value="bidirectional" disabled={entra}>Bidirectional</option><option value="scim_to_ldap">SCIM to LDAP</option><option value="ldap_to_scim" disabled={entra}>LDAP to SCIM</option></select></Field>
           <Field label="Conflict policy" hint="Manual review records conflicts without overwriting either side. Renames and missing linked users require manual intervention."><select value={draft.conflict_policy} onChange={event => {
             const value = event.target.value;
             if (value === 'manual' || value === 'scim_wins' || value === 'ldap_wins') update('conflict_policy', value);

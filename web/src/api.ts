@@ -1,5 +1,10 @@
 export interface Settings {
+  scim_provider: 'generic' | 'entra';
   scim_url: string;
+  entra_tenant_id: string;
+  entra_client_id: string;
+  scim_filter: string;
+  entra_client_secret_configured: boolean;
   ldap_url: string;
   ldap_bind_dn: string;
   ldap_base_dn: string;
@@ -129,12 +134,19 @@ export const message = (error: unknown) =>
   error instanceof Error ? error.message : 'An unexpected error occurred.';
 
 export type SecretEdit = { mode: 'keep' | 'replace' | 'clear'; value: string };
-export type Secrets = { scim_token: SecretEdit; ldap_password: SecretEdit };
+export type Secrets = { scim_token: SecretEdit; ldap_password: SecretEdit; entra_client_secret: SecretEdit };
+
+export function normalizeSettings(settings: Settings): Settings {
+  return Object.assign({
+    scim_provider: 'generic', entra_tenant_id: '', entra_client_id: '',
+    scim_filter: '', entra_client_secret_configured: false,
+  }, settings);
+}
 
 export function settingsPayload(settings: Settings, secrets: Secrets) {
-  const { scim_token_configured, ldap_password_configured, ...payload } = settings;
+  const { scim_token_configured, ldap_password_configured, entra_client_secret_configured, ...payload } = settings;
   const credentials: Partial<Record<keyof Secrets, string>> = {};
-  for (const key of ['scim_token', 'ldap_password'] as const) {
+  for (const key of ['scim_token', 'ldap_password', 'entra_client_secret'] as const) {
     if (secrets[key].mode === 'replace') credentials[key] = secrets[key].value;
     if (secrets[key].mode === 'clear') credentials[key] = '';
   }

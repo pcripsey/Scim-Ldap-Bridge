@@ -3,7 +3,12 @@ import type { Settings, Status } from '../src/api';
 
 const token = 'console-test-admin-token-at-least-24';
 const defaults: Settings = {
+  scim_provider: 'generic',
   scim_url: 'https://identity.example.org/scim/v2',
+  entra_tenant_id: '',
+  entra_client_id: '',
+  scim_filter: '',
+  entra_client_secret_configured: false,
   ldap_url: 'ldaps://directory.example.org:636',
   ldap_bind_dn: 'cn=bridge,dc=example,dc=org',
   ldap_base_dn: 'ou=people,dc=example,dc=org',
@@ -49,10 +54,11 @@ async function environment(page: Page, overrides: Partial<Settings> = {}) {
       if (req.method() === 'PUT') {
         const payload: Record<string, unknown> = req.postDataJSON();
         writes.push(payload);
-        const { scim_token, ldap_password, ...rest } = payload;
+        const { scim_token, ldap_password, entra_client_secret, confirm_scope_reset, ...rest } = payload;
         settings = { ...settings, ...rest };
         if (scim_token !== undefined) settings.scim_token_configured = Boolean(scim_token);
         if (ldap_password !== undefined) settings.ldap_password_configured = Boolean(ldap_password);
+        if (entra_client_secret !== undefined) settings.entra_client_secret_configured = Boolean(entra_client_secret);
         status = { ...status, dry_run: settings.dry_run, enabled: settings.enabled };
         await route.fulfill({ json: { saved: true } }); return;
       }
@@ -152,6 +158,197 @@ test('replaces and explicitly clears connector credentials', async ({ page }) =>
   expect(env.writes[0]).toMatchObject({ scim_token: 'new-connector-secret', ldap_password: '' });
   await expect(page.getByLabel('New scim bearer token', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Test LDAP connection' })).toBeDisabled();
+});
+
+const tenantId = '11111111-2222-3333-4444-555555555555';
+const clientId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+const entraSettings: Partial<Settings> = {
+  scim_provider: 'entra', scim_url: 'https://graph.microsoft.com/rp/scim',
+  entra_tenant_id: tenantId, entra_client_id: clientId,
+  entra_client_secret_configured: true, scim_token_configured: false, direction: 'scim_to_ldap',
+};
+
+test('opts into Entra safely, validates IDs, confirms source identity, and sends OAuth settings', async ({ page }) => {
+  const env = await environment(page, { enabled: true, dry_run: false });
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByLabel('SCIM bearer token', { exact: true }).selectOption('replace');
+  await page.getByLabel('New scim bearer token', { exact: true }).fill('discard-this-static-secret');
+  await page.getByLabel('Provider and authentication').selectOption('entra');
+  await expect(page.getByLabel('SCIM endpoint URL')).toHaveValue('https://graph.microsoft.com/rp/scim');
+  await expect(page.getByLabel('SCIM endpoint URL')).toHaveAttribute('readonly', '');
+  await expect(page.getByLabel('SCIM bearer token', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  expect(await page.getByLabel('Entra tenant ID', { exact: true }).evaluate((input: HTMLInputElement) => input.validity.valueMissing)).toBe(true);
+  await page.getByLabel('Entra tenant ID', { exact: true }).fill('not-a-guid');
+  await page.getByLabel('Entra client ID', { exact: true }).fill(clientId);
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  expect(await page.getByLabel('Entra tenant ID', { exact: true }).evaluate((input: HTMLInputElement) => input.validity.patternMismatch)).toBe(true);
+  await page.getByLabel('Entra tenant ID', { exact: true }).fill(tenantId);
+  await page.getByLabel('Entra client secret', { exact: true }).selectOption('replace');
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  await page.getByLabel('New entra client secret', { exact: true }).fill('new-entra-client-secret');
+  await page.getByRole('button', { name: 'Synchronization', exact: true }).click();
+  await expect(page.getByLabel('Synchronization direction')).toHaveValue('scim_to_ldap');
+  await expect(page.getByLabel('Synchronization direction').locator('option[value="bidirectional"]')).toBeDisabled();
+  await expect(page.getByLabel('Synchronization direction').locator('option[value="ldap_to_scim"]')).toBeDisabled();
+  await expect(page.getByLabel('Enable scheduled synchronization')).not.toBeChecked();
+  await expect(page.getByLabel('Dry-run mode', { exact: true })).toBeChecked();
+  page.once('dialog', async dialog => {
+    expect(dialog.message()).toContain('tenant, client, and source filter');
+    await dialog.dismiss();
+  });
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).toMatchObject({
+    scim_provider: 'entra', scim_url: 'https://graph.microsoft.com/rp/scim',
+    entra_tenant_id: tenantId, entra_client_id: clientId, direction: 'scim_to_ldap',
+    entra_client_secret: 'new-entra-client-secret', enabled: false, dry_run: true,
+    confirm_scope_reset: true,
+  });
+  expect(env.writes[0]).not.toHaveProperty('scim_token');
+  expect(env.writes[0]).not.toHaveProperty('entra_client_secret_configured');
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+});
+
+test('Entra preserves, replaces, and clears its secret with provider-aware readiness', async ({ page }) => {
+  const env = await environment(page, entraSettings);
+  await login(page);
+  await expect(page.getByRole('button', { name: 'Run sync', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Test SCIM connection' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Discover SCIM attributes' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Validate mappings' })).toBeEnabled();
+  await page.getByLabel('Base distinguished name', { exact: true }).fill('ou=changed,dc=example,dc=org');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).not.toHaveProperty('entra_client_secret');
+  await page.getByLabel('Entra client secret', { exact: true }).selectOption('replace');
+  await page.getByLabel('New entra client secret', { exact: true }).fill('replacement-entra-secret');
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  expect(env.writes[1]).toHaveProperty('entra_client_secret', 'replacement-entra-secret');
+  expect(env.writes[1]).not.toHaveProperty('confirm_scope_reset');
+  await page.getByLabel('Entra client secret', { exact: true }).selectOption('clear');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  expect(env.writes[2]).toHaveProperty('entra_client_secret', '');
+  for (const name of ['Test SCIM connection', 'Discover SCIM attributes', 'Validate mappings', 'Run sync']) {
+    await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
+  }
+});
+
+test('returning to generic mode never leaves the Graph endpoint or a pending OAuth replacement', async ({ page }) => {
+  const env = await environment(page, entraSettings);
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByLabel('Entra client secret', { exact: true }).selectOption('replace');
+  await page.getByLabel('New entra client secret', { exact: true }).fill('discard-this-oauth-secret');
+  await page.getByLabel('Provider and authentication').selectOption('generic');
+  await expect(page.getByLabel('SCIM endpoint URL')).toHaveValue('');
+  await expect(page.getByLabel('SCIM endpoint URL')).not.toHaveAttribute('readonly', '');
+  await page.getByLabel('SCIM endpoint URL').fill(defaults.scim_url);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  expect(env.writes[0]).toMatchObject({ scim_provider: 'generic', scim_url: defaults.scim_url, confirm_scope_reset: true });
+  expect(env.writes[0]).not.toHaveProperty('entra_client_secret');
+});
+
+test('legacy settings without provider fields default to generic bearer authentication', async ({ page }) => {
+  await environment(page);
+  const legacy: Record<string, unknown> = { ...defaults };
+  for (const key of ['scim_provider', 'entra_tenant_id', 'entra_client_id', 'scim_filter', 'entra_client_secret_configured']) delete legacy[key];
+  await page.route('**/api/settings', route => route.fulfill({ json: legacy }));
+  await login(page);
+  await expect(page.getByRole('button', { name: 'Run sync', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByLabel('Provider and authentication')).toHaveValue('generic');
+  await expect(page.getByRole('button', { name: 'Test SCIM connection' })).toBeEnabled();
+});
+
+test('Entra requires its own saved OAuth secret even when a bearer token exists', async ({ page }) => {
+  await environment(page, { ...entraSettings, entra_client_secret_configured: false, scim_token_configured: true });
+  await login(page);
+  await expect(page.getByRole('button', { name: 'Run sync', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  for (const name of ['Test SCIM connection', 'Discover SCIM attributes', 'Validate mappings']) {
+    await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
+  }
+});
+
+for (const label of ['Entra tenant ID', 'Entra client ID']) {
+  test(`changing ${label} requires explicit source scope confirmation`, async ({ page }) => {
+    const env = await environment(page, entraSettings);
+    await login(page);
+    await page.getByRole('button', { name: 'Connections', exact: true }).click();
+    await page.getByLabel(label, { exact: true }).fill('99999999-8888-7777-6666-555555555555');
+    page.once('dialog', dialog => dialog.dismiss());
+    await page.getByRole('button', { name: 'Save configuration' }).click();
+    expect(env.writes).toHaveLength(0);
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByRole('button', { name: 'Save configuration' }).click();
+    await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+    expect(env.writes[0]).toHaveProperty('confirm_scope_reset', true);
+    expect(env.writes[0]).not.toHaveProperty('entra_client_secret');
+  });
+}
+
+test('Entra filter scope changes require confirmation and invalid filters retain the draft', async ({ page }) => {
+  const env = await environment(page, entraSettings);
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByLabel('Entra source filter', { exact: true }).fill('userName eq "person@example.org"');
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  expect(env.writes).toHaveLength(0);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+  expect(env.writes[0]).toMatchObject({ scim_filter: 'userName eq "person@example.org"', confirm_scope_reset: true });
+  expect(env.writes[0]).not.toHaveProperty('entra_client_secret');
+  for (const filter of [
+    'userName eq', 'userName eq "unterminated', 'userName eq "\\q"', 'userName eq ""',
+    'userName eq "line\\nfeed"', 'userName eq true', 'active eq "true"', 'active ew true',
+    'groups.value ew "group-id"', 'displayName eq "Ada"', 'not active eq true',
+    'active eq true and userName ew "@example.org"', 'active eq true or active eq false',
+  ]) {
+    await page.getByLabel('Entra source filter', { exact: true }).fill(filter);
+    await page.getByRole('button', { name: 'Save configuration' }).click();
+    await expect(page.getByRole('alert')).toContainText('Invalid Entra source filter.');
+    await expect(page.getByLabel('Entra source filter', { exact: true })).toHaveValue(filter);
+    await expect(page.getByRole('button', { name: 'Run sync', exact: true })).toBeDisabled();
+    expect(env.writes).toHaveLength(1);
+  }
+});
+
+test('Entra accepts the documented single predicate subset including direct group scope', async ({ page }) => {
+  const env = await environment(page, entraSettings);
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await expect(page.getByText(/Grant application permissions User.Read.All and Group.Read.All/)).toBeVisible();
+  await expect(page.getByText(/selects direct members only, not transitive membership/)).toBeVisible();
+  const filters = [
+    'active eq true', 'active eq false', 'userName ew "@example.org"',
+    `groups.value eq "${tenantId}"`, 'id eq "source-user-id"', 'externalId eq "external-user-id"',
+    'userName eq "person@example.org"', 'externalId eq "escaped \\"quote\\" and \\\\ slash"',
+    'externalId eq "\\u0041da"', '',
+  ];
+  for (const [index, filter] of filters.entries()) {
+    await page.getByLabel('Entra source filter', { exact: true }).fill(filter);
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByRole('button', { name: 'Save configuration' }).click();
+    await expect(page.getByRole('button', { name: 'Save configuration' })).toBeDisabled();
+    expect(env.writes[index]).toMatchObject({ scim_filter: filter, confirm_scope_reset: true });
+  }
 });
 
 test('connection tests use saved settings and report success and failures', async ({ page }) => {

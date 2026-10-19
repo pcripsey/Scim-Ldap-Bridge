@@ -52,6 +52,157 @@ for runtime detection; list aliases explicitly if headers are stripped or routin
 can reach another process. Existing bad settings remain readable so they can be
 corrected. Keep the single-instance/worker deployment restriction below.
 
+### Pull users from Microsoft Entra (opt-in)
+
+These are **different topologies**:
+
+- **Entra pushes:** an enterprise application's outbound provisioning client calls
+  this bridge's inbound `/scim/v2` using `BRIDGE_SCIM_TOKEN`.
+- **Bridge pulls:** select **Microsoft Entra — OAuth pull** in Connections. This
+  bridge reads Entra's SCIM Provisioning API and reconciles user attributes to LDAP.
+  Never set the outbound provider URL to this bridge.
+
+The existing **generic SCIM / static bearer token** mode remains the default for
+saved installations. Its `scim_token` and index pagination are unchanged.
+`BRIDGE_ADMIN_TOKEN` authenticates console/admin requests; `BRIDGE_SCIM_TOKEN`
+authenticates incoming provisioning; Entra OAuth credentials authenticate outgoing
+Entra reads. None of these credentials is interchangeable. **An Entra client secret
+is not a bearer token** and must not be entered in the generic SCIM token field.
+
+#### Microsoft prerequisites and setup
+
+Contract checked on 2026-10-19 against Microsoft's official documentation source,
+revision `d9dc367c42d3607d97971aeded9785768175764f` (the two API pages are dated
+2026-09-04). Microsoft Learn was unavailable from the development environment;
+the linked official `MicrosoftDocs/entra-docs` sources were used instead:
+
+- [Enable the API](https://learn.microsoft.com/en-us/entra/identity/app-provisioning/enable-scim-api)
+  ([source](https://github.com/MicrosoftDocs/entra-docs/blob/d9dc367c42d3607d97971aeded9785768175764f/docs/identity/app-provisioning/enable-scim-api.md)).
+- [API reference](https://learn.microsoft.com/en-us/entra/identity/app-provisioning/entra-id-scim-api-reference)
+  ([source](https://github.com/MicrosoftDocs/entra-docs/blob/d9dc367c42d3607d97971aeded9785768175764f/docs/identity/app-provisioning/entra-id-scim-api-reference.md)).
+- [Schema mapping](https://learn.microsoft.com/en-us/entra/identity/app-provisioning/entra-id-scim-api-schema-documentation)
+  ([source](https://github.com/MicrosoftDocs/entra-docs/blob/d9dc367c42d3607d97971aeded9785768175764f/docs/identity/app-provisioning/entra-id-scim-api-schema-documentation.md)).
+- [Release notes](https://github.com/MicrosoftDocs/entra-docs/blob/d9dc367c42d3607d97971aeded9785768175764f/docs/fundamentals/whats-new.md):
+  global GA in March 2026, US Government GA in June 2026; not a preview.
+
+1. Obtain **Entra ID P1**, or a license containing P1, and an active Azure
+   subscription. The SCIM Provisioning API is a **paid add-on**: Microsoft states
+   that **every API call is billed**, monthly through the linked subscription.
+   Dry runs, tests, and discovery still make billable reads. Check Microsoft's
+   current pricing; no fixed price or free-read allowance is assumed here.
+2. A Billing Administrator enables **Entra admin center → ID Governance →
+   Dashboard → SCIM Provisioning API → Get Started**, selects an Azure subscription
+   and resource group, and selects **Turn on**.
+3. An Application Administrator/Cloud Application Administrator creates an app
+   registration in the source tenant. Under **API permissions**, add Microsoft
+   Graph **application** permission `User.Read.All`, and obtain administrator
+   consent. This connector does not support delegated authentication.
+4. For console schema discovery/mapping validation, also grant and consent
+   `Group.Read.All`: Microsoft's discovery endpoints require both user and group
+   read permissions. This does not enable group synchronization. No write
+   permission is needed. Custom-security-attribute schema access additionally
+   requires `CustomSecAttributeDefinition.Read.All`; this connector does not
+   request that schema separately.
+5. Under **Certificates & secrets**, create a client secret. Save its **value**
+   securely and record its expiry. Enter the directory (tenant) ID, application
+   (client) ID, and secret in Connections. Rotate it before expiry.
+
+This implementation supports **public cloud and client secrets only**. The
+resource base is fixed to `https://graph.microsoft.com/rp/scim`, with token requests
+to `https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/token`, using
+`grant_type=client_credentials` and `scope=https://graph.microsoft.com/.default`.
+The requested audience/resource is Microsoft Graph, **not** `/rp/scim` or Graph
+`/users`; Graph user responses are not substituted for SCIM. Certificate,
+managed-identity, US Government, and other sovereign-cloud authentication are
+not implemented, even where Microsoft offers those capabilities.
+
+#### Safe initial configuration
+
+Use the console secret controls, or send these settings to the authenticated
+settings API with your own placeholders substituted (never commit credentials):
+
+```json
+{
+  "scim_provider": "entra",
+  "scim_url": "https://graph.microsoft.com/rp/scim",
+  "entra_tenant_id": "<directory-tenant-GUID>",
+  "entra_client_id": "<application-client-GUID>",
+  "entra_client_secret": "<client-secret-value>",
+  "scim_filter": "userName ew \"@example.org\"",
+  "direction": "scim_to_ldap",
+  "enabled": false,
+  "dry_run": true,
+  "confirm_scope_reset": true
+}
+```
+
+Configure the existing LDAP connection and mappings separately. Secrets are
+encrypted with the existing settings store and never returned by settings reads;
+`entra_client_secret_configured` reports presence only. Omitting a credential
+preserves it, supplying a nonempty value replaces it, and `""` clears it.
+OAuth access tokens are cached **only in the connector instance's memory**,
+renewed before expiry, and discarded when it closes. Credentials are sent only
+to the fixed Microsoft authority using a separate, non-traffic-logging client.
+Redirects and environment proxies are disabled for both Entra clients.
+Authentication/read failures stop the operation without automatic retries;
+there are no Entra writes, including on 401 responses.
+
+#### Scope, discovery, and reconciliation limits
+
+The bridge accepts this deliberately small subset of Microsoft's user filters:
+
+| Source filter | Meaning |
+| --- | --- |
+| Empty | All users visible to the application |
+| `userName eq "person@example.org"` | Exact username |
+| `userName ew "@example.org"` | Username suffix |
+| `id eq "<user-id>"` | Exact resource ID |
+| `externalId eq "<external-id>"` | Exact external ID |
+| `groups.value eq "<group-id>"` | Direct user membership, not transitive membership |
+| `active eq true` / `active eq false` | Active-state scope, **not** LDAP deactivation |
+
+String operands must be nonempty double-quoted JSON strings. Boolean literals
+are case-insensitive. Compound filters, `not`, other operators, and extension
+filter attributes are not accepted by this connector, even though Microsoft
+supports some of them. Parameters are encoded, not appended as URL fragments.
+The same saved filter applies to connection tests, discovery samples, mapping
+validation, manual synchronization, and scheduled synchronization.
+
+Reads use documented lowercase `/users` and `resources`, request `count=100`,
+and carry opaque `nextCursor` values in the next request's `cursor` parameter.
+Cursors are never followed as URLs. The connector treats absent, null, or empty
+`nextCursor` as completion; Microsoft does not explicitly enumerate terminal
+representations. It neither requires `totalResults` nor compares it with the
+accumulated count: the documented cursor examples omit that field. Cursor expiry,
+snapshot/count consistency, and empty-page behavior are not guaranteed by the
+reviewed documentation. Empty pages with a continuing cursor, repeated cursors,
+duplicate/malformed users, failed pages, and inventories above 10,000 users fail
+closed before staging reconciliation. A failed enumeration does not replace
+inventory or synchronization baselines.
+
+Discovery calls real lowercase `/schemas` and `/resourcetypes`, whose documented
+list responses use uppercase `Resources`, then enumerates the complete scoped
+user inventory for samples. It does not fabricate schemas or require generic
+index pagination. Microsoft supports SCIM create/PATCH/delete operations, but
+this connector intentionally rejects remote writes and requires `scim_to_ldap`.
+Ordinary Entra `extension_{appId}_{property}` directory extensions are not exposed
+by the documented SCIM schema.
+
+Changing provider, tenant, client ID, or source filter requires explicit console
+confirmation (API: `confirm_scope_reset=true`), clears inventory and baselines,
+and cancels outstanding planned operations. Changing connector URLs or LDAP
+identity retains the existing reset behavior. **Review the new scope and baseline
+before live LDAP writes.** Start with scheduling disabled and `dry_run=true`,
+test connections, inspect discovery/mappings, and review a manual dry-run plan
+before allowing writes or scheduling.
+
+The existing LDAP `inetOrgPerson` requirements still apply, including nonempty
+`sn`/family name. This is user-profile reconciliation, **not** complete identity
+lifecycle management: filtering out or missing users does not delete/deactivate
+LDAP accounts. Group provisioning, deletion, deactivation, and password
+synchronization remain unsupported. No live Entra authentication or directory
+writes were performed to validate this connector.
+
 Open **http://localhost:8000/** and sign in with your administrator token. The
 Docker build compiles and bundles the React console; no separate web server or
 Node.js runtime is required in the final container.
