@@ -30,6 +30,34 @@ $env:BRIDGE_ADMIN_TOKEN = python -c "import secrets; print(secrets.token_hex(32)
 docker compose up --build -d
 ```
 
+### Published Images (GitHub Container Registry)
+
+The `Publish container image` GitHub Actions workflow tests the backend, builds
+the bundled console and Linux AMD64 container, and publishes to
+`ghcr.io/pcripsey/scim-ldap-bridge`. Pushes to `main` publish `latest` and `main`;
+version tags such as `v1.2.3` publish `1.2.3`. Every build also publishes a
+`sha-<short-commit>` tag. The workflow can also be run manually from Actions.
+Publishing uses the workflow's built-in `GITHUB_TOKEN`; no registry secret is
+required.
+
+To run the published image instead of building locally, set your administrator
+token as described above, then run in PowerShell:
+
+```powershell
+$env:BRIDGE_IMAGE = "ghcr.io/pcripsey/scim-ldap-bridge:latest"
+docker compose pull
+docker compose up --no-build -d
+```
+
+Keep `BRIDGE_IMAGE` set when managing this deployment. To update, repeat the pull
+and up commands; the existing data volume is retained. Omit `BRIDGE_IMAGE` to
+keep the original local-build behavior.
+
+New GitHub packages may be private by default. For anonymous pulls, make the
+container package public in its GitHub package settings. Otherwise authenticate
+Docker to `ghcr.io` with a GitHub token that has `read:packages` access before
+pulling. Never commit that token.
+
 ## Web Configuration Console
 
 The responsive React/TypeScript console includes:

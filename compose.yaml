@@ -1,7 +1,7 @@
 services:
   bridge:
     build: .
-    image: scim-ldap-bridge:local
+    image: ${BRIDGE_IMAGE:-scim-ldap-bridge:local}
     restart: unless-stopped
     ports:
       - "127.0.0.1:${BRIDGE_PORT:-8000}:8000"
