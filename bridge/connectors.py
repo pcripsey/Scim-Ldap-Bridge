@@ -1,6 +1,7 @@
 """Directory transports with metadata logs and redacted DEBUG attribute events."""
 
 import re
+import secrets
 import ssl
 import time
 from functools import wraps
@@ -479,6 +480,7 @@ class LdapClient:
         self.connection = Connection(server, user=self.settings.ldap_bind_dn,
                                      password=self.settings.ldap_password, raise_exceptions=True,
                                      receive_timeout=30,
+                                     auto_referrals=not self.settings.ad_enable_new_accounts,
                                      auto_bind=AUTO_BIND_TLS_BEFORE_BIND if start_tls else AUTO_BIND_NO_TLS)
         return self
 
@@ -499,7 +501,7 @@ class LdapClient:
         users = []
         self._search_payload()
         entries = self.connection.extend.standard.paged_search(
-            self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
+            self.settings.ldap_base_dn, self.settings.ldap_user_filter, attributes=ALL_ATTRIBUTES,
             paged_size=200, generator=True)
         for entry in entries:
             if entry["type"] != "searchResEntry":
@@ -539,7 +541,7 @@ class LdapClient:
     def discovery(self):
         self._search_payload()
         entries = self.connection.extend.standard.paged_search(
-            self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
+            self.settings.ldap_base_dn, self.settings.ldap_user_filter, attributes=ALL_ATTRIBUTES,
             paged_size=200, generator=True)
         count = 0
         for entry in entries:
@@ -564,8 +566,15 @@ class LdapClient:
         ], "users": count}
 
     def write(self, user, existing=None):
+        activate = (not existing and self.settings.ldap_service == "active_directory"
+                    and self.settings.ad_enable_new_accounts)
+        if activate:
+            if self.settings.dry_run:
+                raise ValueError("AD account activation is blocked in dry-run mode.")
+            if not (self.connection.server.ssl is True or self.connection.tls_started is True):
+                raise ValueError("AD account activation requires an encrypted LDAP connection.")
         if not user["familyName"]:
-            raise ValueError("inetOrgPerson requires a nonempty familyName (sn).")
+            raise ValueError("The bridge requires a nonempty familyName (sn).")
         attrs = {}
         for mapping in self.settings.attribute_mappings:
             if mapping.direction not in ("both", "scim_to_ldap"):
@@ -576,7 +585,9 @@ class LdapClient:
             elif existing:
                 attrs[mapping.ldap_attribute] = []
         username = user["userName"]
-        attrs.setdefault("cn", [user["displayName"] or username])
+        active_directory = self.settings.ldap_service == "active_directory"
+        if not active_directory:
+            attrs.setdefault("cn", [user["displayName"] or username])
         attrs.setdefault("sn", [user["familyName"]])
         if existing:
             changes = {field: [(MODIFY_REPLACE, value)] for field, value in attrs.items()}
@@ -584,9 +595,29 @@ class LdapClient:
         else:
             username_attribute = next(mapping.ldap_attribute for mapping in self.settings.attribute_mappings
                                       if mapping.scim_path == "userName")
-            dn = f"{username_attribute}={escape_rdn(username)},{self.settings.ldap_base_dn}"
-            self._add(dn, ["top", "person", "organizationalPerson", "inetOrgPerson"],
-                      {**attrs, username_attribute: [username]})
+            rdn_attribute = "cn" if active_directory else username_attribute
+            if active_directory:
+                attrs["cn"] = [username]
+                attrs["userAccountControl"] = ["514"]
+            dn = f"{rdn_attribute}={escape_rdn(username)},{self.settings.ldap_base_dn}"
+            added = self._add(dn, ["top", "person", "organizationalPerson",
+                                 "user" if active_directory else "inetOrgPerson"],
+                             {**attrs, username_attribute: [username]})
+            if activate:
+                if added is not True:
+                    raise ValueError("AD account creation failed; activation was not attempted.")
+                self._activate_new_ad_account(dn)
+
+    def _activate_new_ad_account(self, dn):
+        password = "aA1!" + secrets.token_urlsafe(48)
+        encoded = ('"' + password + '"').encode("utf-16-le")
+        try:
+            if self._modify(dn, {"unicodePwd": [(MODIFY_REPLACE, [encoded])]}) is not True:
+                raise ValueError("AD password initialization failed; the new account remains disabled.")
+        finally:
+            del password, encoded
+        if self._modify(dn, {"userAccountControl": [(MODIFY_REPLACE, ["512"])]}) is not True:
+            raise ValueError("AD account activation failed; check the new account in AD.")
 
     @_ldap_operation("modify")
     def _modify(self, *args):
@@ -606,7 +637,7 @@ class LdapClient:
         if debug_enabled():
             debug_event("outbound", "ldap", "search_request",
                         {"base_dn": self.settings.ldap_base_dn,
-                         "filter": "(objectClass=inetOrgPerson)", "attributes": ALL_ATTRIBUTES})
+                         "filter": self.settings.ldap_user_filter, "attributes": ALL_ATTRIBUTES})
 
     def _entry_payload(self, entry):
         if debug_enabled():

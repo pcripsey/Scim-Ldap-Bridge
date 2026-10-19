@@ -159,7 +159,14 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             old = store.settings()
             confirmation = payload.pop("confirm_scope_reset", False)
             try:
-                current = Settings.model_validate({**old.model_dump(), **payload})
+                values = {**old.model_dump(), **payload}
+                if values["ldap_service"] != old.ldap_service:
+                    values.update(enabled=False, dry_run=True)
+                    if values["ldap_service"] != "active_directory":
+                        values["ad_enable_new_accounts"] = False
+                    if "attribute_mappings" not in payload:
+                        values.pop("attribute_mappings")
+                current = Settings.model_validate(values)
             except ValidationError as error:
                 messages = [item["msg"] for item in error.errors(include_input=False, include_context=False)]
                 raise HTTPException(400, "; ".join(messages)) from None
@@ -175,7 +182,8 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                 raise HTTPException(400, "Source identity/scope changes reset inventory and baselines. "
                                     "Review the scope and confirm with confirm_scope_reset=true.")
             reset = scope_changed or any(getattr(old, key) != getattr(current, key)
-                                        for key in ("scim_url", "ldap_url", "ldap_base_dn", "ldap_bind_dn"))
+                                        for key in ("scim_url", "ldap_url", "ldap_base_dn", "ldap_bind_dn",
+                                                    "ldap_service"))
             store.save_settings(current, reset=reset)
             service.revision += 1
             store.event("info", "Configuration saved." + (" Identity baselines reset." if reset else ""))
@@ -294,7 +302,10 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         except (AttributeError, TypeError, KeyError, ValueError):
             raise HTTPException(400, "Invalid SCIM attribute types.") from None
         if not user["familyName"]:
-            raise HTTPException(400, "name.familyName is required by the inetOrgPerson schema.")
+            detail = ("name.familyName is required by this bridge's Active Directory mapping."
+                      if settings.ldap_service == "active_directory"
+                      else "name.familyName is required by the inetOrgPerson schema.")
+            raise HTTPException(400, detail)
         return user
 
     @app.get("/scim/v2/ServiceProviderConfig", dependencies=[Depends(provisioning)])

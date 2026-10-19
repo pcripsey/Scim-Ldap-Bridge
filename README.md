@@ -196,8 +196,8 @@ before live LDAP writes.** Start with scheduling disabled and `dry_run=true`,
 test connections, inspect discovery/mappings, and review a manual dry-run plan
 before allowing writes or scheduling.
 
-The existing LDAP `inetOrgPerson` requirements still apply, including nonempty
-`sn`/family name. This is user-profile reconciliation, **not** complete identity
+The selected LDAP service profile applies; the bridge requires a nonempty
+`sn`/family name for every profile. This is user-profile reconciliation, **not** complete identity
 lifecycle management: filtering out or missing users does not delete/deactivate
 LDAP accounts. Group provisioning, deletion, deactivation, and password
 synchronization remain unsupported. No live Entra authentication or directory
@@ -248,7 +248,9 @@ The responsive React/TypeScript console includes:
 
 - **Overview:** connector configuration state, inventory counts, linked identities,
   synchronization status, recent runs, and events.
-- **Connections:** SCIM URL/token and LDAP URL, bind DN/password, base DN, and StartTLS.
+- **Connections:** separate inbound **SCIM push** deployment instructions,
+  outbound **generic SCIM** or **Microsoft Entra ID OAuth pull** credentials,
+  and LDAP service selection, URL, bind credentials, base DN, and StartTLS.
   Test saved connectors before syncing. Saved credentials are never returned;
   explicitly choose to replace or clear them, otherwise they remain unchanged.
 - **Attribute mapping** (on Connections): SCIM-to-LDAP mappings and the opt-in
@@ -559,10 +561,91 @@ Sensitive-looking attributes are excluded. Map SCIM paths to LDAP attributes wit
 per-rule directions, validate mappings against both connected sources, inspect a
 sample comparison, and save the mapping with the rest of the encrypted settings.
 Defaults map `userName`
-to `uid`, names to `givenName`/`sn`, `displayName` to `displayName`, and primary email
+to `uid` (`sAMAccountName` for AD DS), names to `givenName`/`sn`, `displayName` to `displayName`, and primary email
 to `mail`. SCIM paths are simple dotted paths, with extension attributes addressable
 by their full extension URN and attribute name. Mapping values are copied as-is; this
 is not a transformation language or a general-purpose schema/mapping engine.
+
+### LDAP service profiles and required attributes
+
+Choose **Connections → LDAP service** before customizing mappings:
+
+| Service | Default username attribute | User search / creation class | Required attributes |
+| --- | --- | --- | --- |
+| Generic LDAP (default) | `uid` | `inetOrgPerson` | Username identity, `cn`, `sn` |
+| OpenLDAP | `uid` | `inetOrgPerson` | Username identity, `cn`, `sn` |
+| 389 Directory Server / Red Hat Directory Server | `uid` | `inetOrgPerson` | Username identity, `cn`, `sn` |
+| Microsoft Active Directory Domain Services | `sAMAccountName` | `user`, restricted to `objectCategory=person` for searches | Username identity, `cn`; `sn` additionally required by this bridge |
+
+All profiles also default to `givenName`, `sn`, `displayName`, and `mail` for
+the corresponding SCIM name, display name, and email fields. `userName` must
+be mapped in both directions and unique in the search base. Supply
+`name.familyName` in the source; surnames are never fabricated. For inetOrgPerson,
+`cn` defaults to display name or username unless explicitly mapped, and the
+username attribute forms the RDN. AD uses `cn=<escaped userName>` for new DNs;
+display-name updates do not rename existing AD accounts.
+
+AD creates **disabled** accounts (`userAccountControl=514`) by default. Opt in to
+**Enable new AD accounts** in Connections (`ad_enable_new_accounts=true` in the
+API) to initialize a cryptographically random password over certificate-verified
+LDAPS or StartTLS, then enable the newly created account (`userAccountControl=512`).
+The password is generated in memory, never returned or persisted, and is not
+synchronized from the source. Users need a separate password-reset process.
+Delegate user creation, password reset, and account-control permissions to the
+bind identity. Referral following is disabled for this option.
+
+Creation is ordered: add disabled, set password, enable only after success.
+Password-policy rejection leaves the new account disabled. Activation errors or
+network timeouts require administrator review; the directory may have committed
+an operation before a connection failure. Partial accounts are not deleted.
+Retries treat already-created accounts as existing and do not reset their
+passwords or activate them. Existing accounts are always unchanged by this option.
+Dry runs do not initialize passwords or enable accounts. Changing LDAP service
+in the console clears the opt-in. Test against your domain password policy before
+production use; custom password filters may reject generated passwords.
+
+Without this option, set passwords and activate accounts using native AD tooling. AD naming,
+object class, and account status attributes cannot be mapped. Use an appropriate
+OU/base DN, delegated create/update permissions, and directory-valid usernames
+(including AD's `sAMAccountName` constraints). AD DS is not Microsoft Entra ID.
+Profiles do not provision POSIX/FreeIPA accounts or discover custom schema MUST
+attributes. Local schema extensions may require additional mappings.
+
+Changing service in the console asks before replacing **all** mappings with the
+profile defaults. Saving a service change clears cached inventory and baselines,
+pauses scheduling, and enables dry run on the server too. Test and inspect a dry
+run before allowing writes. Existing saved installations retain the generic
+profile and their mappings. API clients can set `ldap_service` to `generic`,
+`openldap`, `389ds`, or `active_directory`; when changing service, omitted
+`attribute_mappings` selects defaults, while an explicit list preserves custom
+mappings. The console highlights identity, schema-required, bridge-required,
+and automatically generated attributes. Discovery samples do not prove schema
+compliance.
+
+### Password synchronization feasibility
+
+There is intentionally **no password-sync toggle**; the new-account initialization
+option above is not password synchronization. SCIM's `password` attribute
+is write-only, so reconciliation cannot retrieve existing passwords. Entra OAuth
+pull does not expose existing user passwords; Entra enterprise-app SCIM
+provisioning is not a channel for exporting users' existing passwords. The
+LDAP bind password is a service-account credential, not a user's password.
+
+For **AD DS → Entra** password hash synchronization, use Microsoft Entra Connect
+Sync or Cloud Sync where supported; that does not provide **Entra → LDAP**
+password export. Manage LDAP password resets using native directory tooling or
+a separately designed password-change integration. Such an integration would
+need an actual password-change source, explicit one-way opt-in, verified TLS,
+directory-specific password operations and permissions, and guarantees that
+passwords never enter inventory, operations, responses, or logs. It cannot be
+implemented safely by simply allowing password attribute mappings.
+
+Password mappings remain blocked. Inbound password fields are rejected by
+default or discarded by the ignore-unsupported-fields policy; discarding them
+does not set or synchronize passwords. Reference:
+[SCIM password definition (RFC 7643 §4.1.1)](https://www.rfc-editor.org/rfc/rfc7643#section-4.1.1),
+[Microsoft password hash synchronization](https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/whatis-phs).
+No live password synchronization or AD DS integration was tested.
 
 ### Ignoring unsupported or unmapped inbound fields
 
@@ -618,8 +701,8 @@ operations, configurable attribute transforms/defaults, full multivalue mapping,
 arbitrary custom schema discovery/provisioning are not implemented. PATCH supports
 only `name`, `name.givenName`, `name.familyName`, `displayName`, and `emails` paths,
 not every writable User attribute or every SCIM path/value combination (see the
-ignore option above for skipping unsupported paths). LDAP writes still use the
-`inetOrgPerson` object classes and require a family name. Validate actual Entra
+ignore option above for skipping unsupported paths). LDAP writes use the selected
+profile's `inetOrgPerson` or AD `user` object classes and require a family name. Validate actual Entra
 provisioning behavior in a test tenant before production use.
 
 LDAP uses certificate-verified LDAPS (`ldaps://`, port 636, implicit TLS) or StartTLS

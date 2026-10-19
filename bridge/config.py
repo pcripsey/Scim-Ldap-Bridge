@@ -74,6 +74,8 @@ class Settings(BaseModel):
     entra_client_id: str = ""
     entra_client_secret: str = Field(default="", repr=False)
     scim_filter: str = Field(default="", max_length=2048)
+    ldap_service: Literal["generic", "openldap", "389ds", "active_directory"] = "generic"
+    ad_enable_new_accounts: bool = Field(default=False, strict=True)
     ldap_url: str = ""
     ldap_bind_dn: str = ""
     ldap_password: str = Field(default="", repr=False)
@@ -90,6 +92,23 @@ class Settings(BaseModel):
     dry_run: bool = True
     ignore_unsupported_fields: bool = Field(default=False, strict=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def service_defaults(cls, values):
+        if isinstance(values, dict) and "attribute_mappings" not in values:
+            values = dict(values)
+            values["attribute_mappings"] = [
+                {**item, "ldap_attribute": "sAMAccountName"}
+                if values.get("ldap_service") == "active_directory" and item["scim_path"] == "userName"
+                else dict(item) for item in DEFAULT_ATTRIBUTE_MAPPINGS
+            ]
+        return values
+
+    @property
+    def ldap_user_filter(self):
+        return ("(&(objectClass=user)(objectCategory=person))"
+                if self.ldap_service == "active_directory" else "(objectClass=inetOrgPerson)")
+
     @property
     def scim_configured(self):
         if self.scim_provider == "entra":
@@ -99,6 +118,12 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_endpoints(self):
+        if self.ad_enable_new_accounts:
+            if self.ldap_service != "active_directory":
+                raise ValueError("New account activation is only available for Active Directory.")
+            if not (self.ldap_url.lower().startswith("ldaps://")
+                    or (self.ldap_url.lower().startswith("ldap://") and self.ldap_start_tls)):
+                raise ValueError("AD account activation requires LDAPS or StartTLS.")
         paths = [item.scim_path.casefold() for item in self.attribute_mappings]
         attributes = [item.ldap_attribute.casefold() for item in self.attribute_mappings]
         if len(paths) != len(set(paths)) or len(attributes) != len(set(attributes)):
@@ -108,6 +133,11 @@ class Settings(BaseModel):
         username_mapping = next(item for item in self.attribute_mappings if item.scim_path == "userName")
         if username_mapping.direction != "both":
             raise ValueError("The userName mapping must be enabled in both directions.")
+        if self.ldap_service == "active_directory" and any(
+                attribute in {"cn", "distinguishedname", "objectclass", "objectcategory", "useraccountcontrol"}
+                for attribute in attributes):
+            raise ValueError("AD naming, object class, and account status attributes are managed by the bridge "
+                             "or native AD tools, not attribute mappings.")
         for value, schemes in ((self.scim_url, ("https", "http")),
                                (self.ldap_url, ("ldaps", "ldap"))):
             if value:
