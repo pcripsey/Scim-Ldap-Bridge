@@ -19,6 +19,14 @@ restart. An optional, distinct `BRIDGE_SCIM_TOKEN` enables inbound provisioning.
 Both tokens must be at least 24 characters. Do not commit tokens to source control.
 The port binds to localhost by default; use a TLS reverse proxy for remote access.
 
+These credentials serve different purposes:
+
+- `BRIDGE_ADMIN_TOKEN`: administrator console and management API access.
+- `BRIDGE_SCIM_TOKEN`: optional, distinct token for clients provisioning into this
+  bridge's `/scim/v2` endpoints.
+- Saved connector setting `scim_token`: outbound authentication to the remote
+  SCIM provider; it is not either of the deployment tokens.
+
 Open **http://localhost:8000/** and sign in with your administrator token. The
 Docker build compiles and bundles the React console; no separate web server or
 Node.js runtime is required in the final container.
@@ -174,6 +182,84 @@ historical backups may still contain their original plaintext.
 Run one service instance and one Uvicorn worker per data volume. SQLite and the
 in-process synchronization lock are not a multi-replica coordination mechanism.
 For local development, `BRIDGE_DATA_DIR` defaults to `./data`.
+
+## Traffic Logs And Troubleshooting
+
+The standard-library `bridge.traffic` logger emits structured JSON to stdout.
+View it with `docker compose logs -f bridge`, or
+`docker logs -f <container-name>`. In Unraid, click the container icon and select
+**Logs**. Traffic logs are separate from the console's persisted Activity history;
+polling does not add per-request SQLite records.
+
+| Environment variable | Default | Behavior |
+| --- | --- | --- |
+| `BRIDGE_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `OFF` |
+| `BRIDGE_LOG_POLLS` | `false` | Successful `/healthz` and `/api/status` requests log at `DEBUG`; `true` promotes them to `INFO` |
+
+Failures are not demoted as successful polls. Change these deployment variables
+and recreate the container (`docker compose up -d`) to apply them. `DEBUG` does
+**not** enable payload logging.
+
+Entries include `timestamp`, `level`, `direction`, `protocol`, `operation`,
+`result`, `duration_ms`, and `request_id`, plus safe operation-specific metadata:
+
+- Inbound HTTP requests receive a generated ID returned as `X-Request-ID`;
+  client-supplied request IDs are ignored. Routes use templates with resource IDs
+  redacted; unknown paths are redacted and query strings are never logged.
+  Forwarded client IP headers are neither trusted nor used. Optional `CF-Ray`
+  metadata is strictly validated but remains untrusted, never authentication.
+- Every outbound SCIM send is recorded, including each pagination request,
+  discovery, and writes. Logs include HTTP status or a safe transport exception
+  class, destination scheme/host/port, and a redacted path template, not query
+  strings or URL credentials. Only allowlisted response media types and validated
+  upstream `CF-Ray` or UUID/hex `X-Request-ID` values are retained.
+- LDAP logs include TLS mode, operation, numeric LDAP result/category, and
+  aggregate result count where applicable. Connection, StartTLS, and bind are
+  one `connect_starttls_bind` event (or `connect_bind`), covering ldap3's
+  `auto_bind` lifecycle. Search logging also covers failures during lazy result
+  consumption. DNs and filters are not logged.
+- Background work has its own generated request ID. A manually triggered job
+  also has `parent_id` linking it to the initiating request.
+
+No request/response bodies, directory attributes, credentials, cookies, or
+authorization headers are logged, even at `DEBUG`. Raw Uvicorn access logs and
+httpx/httpcore/ldap3 logging are disabled to prevent accidental disclosure;
+Uvicorn exception tracebacks are reduced to a safe exception class.
+
+Illustrative sanitized entries (synthetic metadata):
+
+```json
+{"timestamp":"2026-01-01T12:00:00.000+00:00","level":"INFO","direction":"inbound","protocol":"http","operation":"request","result":"success","duration_ms":2.1,"request_id":"11111111111141118111111111111111","method":"GET","path":"/api/status","status":200}
+{"timestamp":"2026-01-01T12:00:01.000+00:00","level":"WARNING","direction":"outbound","protocol":"scim","operation":"request","result":"forbidden","duration_ms":41.2,"request_id":"22222222222242228222222222222222","method":"GET","path":"/Users","status":403,"scheme":"https","host":"scim.example.com","port":443}
+{"timestamp":"2026-01-01T12:00:02.000+00:00","level":"INFO","direction":"outbound","protocol":"ldap","operation":"connect_starttls_bind","result":"success","duration_ms":18.4,"request_id":"33333333333343338333333333333333","scheme":"ldap","host":"ldap.example.com","port":389,"tls_mode":"starttls","ldap_result":0}
+```
+
+The successful poll example requires `BRIDGE_LOG_POLLS=true` at `INFO`.
+
+### Diagnosing Provisioning And Connector Failures
+
+1. Distinguish Entra provisioning **into this bridge** from this bridge's
+   **outbound connector**. Verify the appropriate URL and token for that direction;
+   do not substitute the administrator token for an inbound or saved outbound token.
+2. Correlate the returned bridge `X-Request-ID` with traffic logs and manual job
+   `parent_id`. The generic `/api/test/{connector}` response contract is unchanged;
+   its correlated outbound logs explain the remote status or safe failure class.
+   An inbound `401` is an authentication rejection; an inbound `503` indicates
+   unavailable service/configuration. An outbound SCIM `403` is a rejection on the
+   remote request, not proof that inbound bridge authentication failed.
+3. Compare Entra provisioning diagnostics, reverse-proxy/Cloudflare events, and
+   bridge timestamps/statuses. An HTML response alone does not identify its source
+   or prove Cloudflare blocked it. Investigate endpoint configuration, application
+   authentication, and proxy policy rather than assuming any one cause. Do not
+   broadly bypass WAF or authentication protections.
+4. Requests blocked before reaching the app cannot appear in its logs. Absence of
+   an entry is not proof of a block: also check log level (`OFF`/poll suppression),
+   container/version, retention, and log availability.
+5. For credential/decryption failures such as `InvalidToken`, keep the original
+   `encryption.key` and database together and verify the mounted data directory.
+   The exception class is safe diagnostic information; do not share keys, database
+   contents, tokens, or raw payloads. Rotate any credentials exposed during
+   troubleshooting and share only sanitized metadata.
 
 ## Management API
 

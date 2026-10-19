@@ -3,6 +3,7 @@ import time
 
 from bridge.connectors import LdapClient, ScimClient
 from bridge.planner import canonical, plan
+from bridge.traffic import correlation_id, elapsed, emit, new_id
 
 
 class BusyError(Exception):
@@ -57,14 +58,26 @@ class SyncService:
         try:
             settings = self.store.settings()
             run_id = self.store.begin_run(settings.dry_run)
-            self.worker = threading.Thread(target=self.run, args=(settings, run_id), daemon=True)
+            self.worker = threading.Thread(target=self.run, args=(settings, run_id, correlation_id.get()), daemon=True)
             self.worker.start()
             return run_id
         except Exception:
             self.lock.release()
             raise
 
-    def run(self, settings, run_id):
+    def run(self, settings, run_id, parent_id=""):
+        token = correlation_id.set(new_id())
+        start = time.perf_counter()
+        result = "exception"
+        try:
+            result = self._run(settings, run_id)
+        finally:
+            try:
+                emit("internal", "sync", "reconcile", result, elapsed(start), parent_id=parent_id)
+            finally:
+                correlation_id.reset(token)
+
+    def _run(self, settings, run_id):
         processed = changed = conflicts = errors = 0
         try:
             with ScimClient(settings) as scim_client, LdapClient(settings) as ldap_client:
@@ -115,3 +128,4 @@ class SyncService:
                 self.store.finish_run(run_id, status, processed, changed, conflicts, errors)
             finally:
                 self.lock.release()
+        return status
