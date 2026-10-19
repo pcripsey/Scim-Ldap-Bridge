@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import {
   ApiError, message, request, settingsPayload,
-  type Event, type Operation, type Resource, type Run, type SecretEdit,
+  type AttributeDiscovery, type Event, type Operation, type Resource, type Run, type SecretEdit,
   type Secrets, type Settings, type Status,
 } from './api';
 
@@ -146,6 +146,7 @@ function Console({ session, onLogout }: {
   const [saved, setSaved] = useState(session.settings);
   const [draft, setDraft] = useState(session.settings);
   const [secrets, setSecrets] = useState(emptySecrets);
+  const [discovery, setDiscovery] = useState<Partial<Record<'scim' | 'ldap', AttributeDiscovery>>>({});
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState<{ text: string; kind: string } | null>(null);
   const [pollError, setPollError] = useState('');
@@ -239,6 +240,14 @@ function Console({ session, onLogout }: {
     });
   }
 
+  function discover(connector: 'scim' | 'ldap') {
+    void action(`discover-${connector}`, async () => {
+      const result = await api<AttributeDiscovery>(`/api/discovery/${connector}`, { method: 'POST' });
+      setDiscovery(previous => ({ ...previous, [connector]: result }));
+      return `Discovered ${result.attributes.length} ${connector.toUpperCase()} attributes from ${result.users} users.`;
+    });
+  }
+
   function sync() {
     if (!status.dry_run && !window.confirm('Start a live synchronization? This can write changes to your configured directories.')) return;
     void action('sync', async () => {
@@ -319,6 +328,43 @@ function Console({ session, onLogout }: {
             <div className="test-row"><button type="button" disabled={dirty || !saved.ldap_url || !saved.ldap_bind_dn || !saved.ldap_base_dn || !saved.ldap_password_configured} onClick={() => test('ldap')}><Database size={16} />{busy === 'test-ldap' ? 'Testing...' : 'Test LDAP connection'}</button></div>
           </Panel>
         </div>
+        <Panel title="Attribute mapping" subtitle="Map SCIM paths to LDAP attributes. Discovery uses saved, read-only connections.">
+          <p className="body-copy">The userName mapping identifies accounts. Passwords and other sensitive attributes are excluded from discovery.</p>
+          <div className="button-row mapping-discovery">
+            <button type="button" disabled={dirty || !saved.scim_url || !saved.scim_token_configured || Boolean(busy)}
+              onClick={() => discover('scim')}>{busy === 'discover-scim' ? 'Discovering SCIM...' : 'Discover SCIM attributes'}</button>
+            <button type="button" disabled={dirty || !saved.ldap_url || !saved.ldap_base_dn || !saved.ldap_bind_dn || !saved.ldap_password_configured || Boolean(busy)}
+              onClick={() => discover('ldap')}>{busy === 'discover-ldap' ? 'Discovering LDAP...' : 'Discover LDAP attributes'}</button>
+          </div>
+          {draft.attribute_mappings.map((mapping, index) => <div className="mapping-row" key={`${index}-${mapping.scim_path}`}>
+            <Field label={`SCIM path ${index + 1}`} hint="Use dotted paths for nested scalar attributes, such as name.givenName.">
+              <input required list="scim-attribute-options" value={mapping.scim_path} onChange={event => update('attribute_mappings', draft.attribute_mappings.map((item, row) => row === index ? { ...item, scim_path: event.target.value } : item))} />
+            </Field>
+            <Field label={`LDAP attribute ${index + 1}`}>
+              <input required list="ldap-attribute-options" value={mapping.ldap_attribute} onChange={event => update('attribute_mappings', draft.attribute_mappings.map((item, row) => row === index ? { ...item, ldap_attribute: event.target.value } : item))} />
+            </Field>
+            <Field label={`Direction ${index + 1}`}>
+              <select value={mapping.direction} onChange={event => {
+                const value = event.target.value;
+                if (value === 'both' || value === 'scim_to_ldap' || value === 'ldap_to_scim') {
+                  update('attribute_mappings', draft.attribute_mappings.map((item, row) => row === index ? { ...item, direction: value } : item));
+                }
+              }}><option value="both">Both directions</option><option value="scim_to_ldap">SCIM to LDAP</option><option value="ldap_to_scim">LDAP to SCIM</option></select>
+            </Field>
+            <button type="button" aria-label={`Remove mapping ${index + 1}`} disabled={draft.attribute_mappings.length === 1}
+              onClick={() => update('attribute_mappings', draft.attribute_mappings.filter((_, row) => row !== index))}>Remove</button>
+          </div>)}
+          <datalist id="scim-attribute-options">{(discovery.scim?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
+          <datalist id="ldap-attribute-options">{(discovery.ldap?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
+          <div className="button-row mapping-discovery"><button type="button" onClick={() => update('attribute_mappings', [...draft.attribute_mappings, { scim_path: '', ldap_attribute: '', direction: 'both' }])}>Add mapping</button></div>
+          {(discovery.scim || discovery.ldap) && <div className="mapping-discovery-results">
+            {(['scim', 'ldap'] as const).map(source => discovery[source] && <div key={source}>
+              <strong>{source.toUpperCase()} discovered attributes</strong>
+              <ul>{discovery[source]!.attributes.map(attribute => <li key={attribute.name}><code>{attribute.name}</code>
+                {attribute.samples.length > 0 && <small>Sample: {attribute.samples.join(', ')}</small>}</li>)}</ul>
+            </div>)}
+          </div>}
+        </Panel>
       </> : <>
         <div className="two-columns"><Panel title="Reconciliation policy" subtitle="Choose the source of truth for your identities">
           <Field label="Synchronization direction"><select value={draft.direction} onChange={event => {

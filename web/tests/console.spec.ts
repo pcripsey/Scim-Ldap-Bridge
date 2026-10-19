@@ -7,6 +7,13 @@ const defaults: Settings = {
   ldap_url: 'ldaps://directory.example.org:636',
   ldap_bind_dn: 'cn=bridge,dc=example,dc=org',
   ldap_base_dn: 'ou=people,dc=example,dc=org',
+  attribute_mappings: [
+    { scim_path: 'userName', ldap_attribute: 'uid', direction: 'both' },
+    { scim_path: 'name.givenName', ldap_attribute: 'givenName', direction: 'both' },
+    { scim_path: 'name.familyName', ldap_attribute: 'sn', direction: 'both' },
+    { scim_path: 'displayName', ldap_attribute: 'displayName', direction: 'both' },
+    { scim_path: 'emails.value', ldap_attribute: 'mail', direction: 'both' },
+  ],
   ldap_start_tls: true,
   ldap_allow_insecure: false,
   direction: 'bidirectional',
@@ -52,6 +59,16 @@ async function environment(page: Page, overrides: Partial<Settings> = {}) {
       await route.fulfill({ json: settings }); return;
     }
     if (url.pathname.startsWith('/api/test/')) { await route.fulfill({ json: { ok: true, users: 26 } }); return; }
+    if (url.pathname.startsWith('/api/discovery/')) {
+      const connector = url.pathname.split('/').at(-1);
+      await route.fulfill({ json: {
+        schemas: [], users: 1,
+        attributes: connector === 'scim'
+          ? [{ name: 'name.givenName', samples: ['Ada'] }, { name: 'employeeNumber', samples: ['42'] }]
+          : [{ name: 'givenName', samples: ['Ada'] }, { name: 'employeeNumber', samples: ['42'] }],
+      } });
+      return;
+    }
     if (url.pathname === '/api/sync') { await route.fulfill({ status: 202, json: { run_id: 8 } }); return; }
     if (url.pathname === '/api/data/resources') {
       const offset = Number(url.searchParams.get('offset') ?? 0);
@@ -145,6 +162,25 @@ test('connection tests use saved settings and report success and failures', asyn
   await expect(page.getByRole('alert')).toContainText('Check TLS');
   await page.getByLabel('Base distinguished name', { exact: true }).fill('dc=changed');
   await expect(page.getByRole('button', { name: 'Test SCIM connection' })).toBeDisabled();
+});
+
+test('discovers attributes and saves editable mappings', async ({ page }) => {
+  const env = await environment(page);
+  await login(page);
+  await page.getByRole('button', { name: 'Connections', exact: true }).click();
+  await page.getByRole('button', { name: 'Discover SCIM attributes' }).click();
+  await expect(page.getByText('employeeNumber', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Discover LDAP attributes' }).click();
+  await expect(page.getByText('givenName', { exact: true }).last()).toBeVisible();
+  await page.getByLabel('SCIM path 5').fill('employeeNumber');
+  await page.getByLabel('LDAP attribute 5').fill('employeeNumber');
+  await page.getByRole('button', { name: 'Save configuration' }).click();
+  await expect(page.getByText('Configuration saved. Your next run will use these settings.')).toBeVisible();
+  expect(env.writes[0]).toMatchObject({
+    attribute_mappings: expect.arrayContaining([
+      { scim_path: 'employeeNumber', ldap_attribute: 'employeeNumber', direction: 'both' },
+    ]),
+  });
 });
 
 test('live settings and live runs require confirmation', async ({ page }) => {

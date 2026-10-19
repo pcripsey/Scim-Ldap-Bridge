@@ -5,6 +5,7 @@ import httpx
 from ldap3 import ALL_ATTRIBUTES, AUTO_BIND_NO_TLS, AUTO_BIND_TLS_BEFORE_BIND, MODIFY_REPLACE, Connection, Server, Tls
 from ldap3.utils.dn import escape_rdn
 
+from bridge.config import DEFAULT_ATTRIBUTE_MAPPINGS
 from bridge.planner import canonical
 
 
@@ -23,30 +24,87 @@ def index_users(users):
     return indexed
 
 
-def from_scim(resource):
-    name = resource.get("name") or {}
-    emails = resource.get("emails") or []
-    email = next((item for item in emails if item.get("primary")), emails[0] if emails else {})
-    return {**canonical({"userName": resource.get("userName"), "givenName": name.get("givenName"),
-                         "familyName": name.get("familyName"), "displayName": resource.get("displayName"),
-                         "email": email.get("value")}), "_id": resource.get("id"), "_raw": resource}
+def mapping_parts(path):
+    if path.startswith("urn:") and ":" in path:
+        schema, attribute = path.rsplit(":", 1)
+        return schema, attribute
+    return tuple(path.split("."))
 
 
-def scim_document(user, existing=None):
-    document = dict(existing or {})
-    emails = [dict(item) for item in document.get("emails", [])]
-    primary = next((index for index, item in enumerate(emails) if item.get("primary")), 0)
-    if emails:
-        if user["email"]:
-            emails[primary]["value"] = user["email"]
+def scim_value(resource, path):
+    if path == "emails.value":
+        emails = resource.get("emails") or []
+        selected = next((item for item in emails if item.get("primary")), emails[0] if emails else {})
+        return selected.get("value", "")
+    value = resource
+    for part in mapping_parts(path):
+        if not isinstance(value, dict):
+            return ""
+        value = value.get(part)
+    return value if value is not None else ""
+
+
+def assign_mapping(user, path, value):
+    field = {"userName": "userName", "name.givenName": "givenName",
+             "name.familyName": "familyName", "displayName": "displayName",
+             "emails.value": "email"}.get(path)
+    if field:
+        if isinstance(value, list):
+            value = value[0] if value else ""
+        user[field] = str(value or "")
+    else:
+        user.setdefault("_mapped", {})[path] = value
+
+
+def mapped_value(user, path):
+    field = {"userName": "userName", "name.givenName": "givenName",
+             "name.familyName": "familyName", "displayName": "displayName",
+             "emails.value": "email"}.get(path)
+    return user.get(field, "") if field else user.get("_mapped", {}).get(path, "")
+
+
+def set_scim_value(document, path, value):
+    if path == "emails.value":
+        emails = document.setdefault("emails", [])
+        selected = next((item for item in emails if item.get("primary")), emails[0] if emails else None)
+        if value in (None, ""):
+            if selected:
+                emails.remove(selected)
+        elif selected:
+            selected["value"] = value
         else:
-            emails.pop(primary)
-    elif user["email"]:
-        emails.append({"value": user["email"], "type": "work", "primary": True})
-    document.update({"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
-                     "userName": user["userName"], "displayName": user["displayName"],
-                     "name": {**document.get("name", {}), "givenName": user["givenName"],
-                              "familyName": user["familyName"]}, "emails": emails})
+            emails.append({"value": value, "type": "work", "primary": True})
+        return
+    parts = mapping_parts(path)
+    target = document
+    for part in parts[:-1]:
+        target = target.setdefault(part, {})
+    if value not in (None, ""):
+        target[parts[-1]] = value
+
+
+def from_scim(resource, mappings=None):
+    user = canonical({})
+    for mapping in mappings or DEFAULT_ATTRIBUTE_MAPPINGS:
+        assign_mapping(user, mapping.scim_path if hasattr(mapping, "scim_path") else mapping["scim_path"],
+                      scim_value(resource, mapping.scim_path if hasattr(mapping, "scim_path") else mapping["scim_path"]))
+    return {**user, "_id": resource.get("id"), "_raw": resource}
+
+
+def scim_document(user, existing=None, mappings=None):
+    document = dict(existing or {})
+    document["schemas"] = list(dict.fromkeys([
+        *(document.get("schemas") or []), "urn:ietf:params:scim:schemas:core:2.0:User",
+    ]))
+    for mapping in mappings or DEFAULT_ATTRIBUTE_MAPPINGS:
+        path = mapping.scim_path if hasattr(mapping, "scim_path") else mapping["scim_path"]
+        direction = mapping.direction if hasattr(mapping, "direction") else mapping.get("direction", "both")
+        if direction in ("both", "ldap_to_scim"):
+            set_scim_value(document, path, mapped_value(user, path))
+            if path.startswith("urn:"):
+                schema, _ = path.rsplit(":", 1)
+                if schema not in document["schemas"]:
+                    document["schemas"].append(schema)
     return document
 
 
@@ -54,6 +112,8 @@ class ScimClient:
     def __init__(self, settings):
         if not settings.scim_url or not settings.scim_token:
             raise ValueError("SCIM endpoint and bearer token are required.")
+        self.settings = settings
+        self.discovered_attributes = {}
         self.client = httpx.Client(base_url=settings.scim_url.rstrip("/") + "/", timeout=30,
                                    headers={"Authorization": f"Bearer {settings.scim_token}",
                                             "Accept": "application/scim+json",
@@ -75,7 +135,9 @@ class ScimClient:
             resources = page.get("Resources", [])
             if not isinstance(resources, list):
                 raise ValueError("Invalid SCIM list response.")
-            users.extend(from_scim(resource) for resource in resources)
+            for resource in resources:
+                collect_attribute_samples(resource, self.discovered_attributes)
+                users.append(from_scim(resource, self.settings.attribute_mappings))
             if len(users) > MAX_USERS:
                 raise ValueError("Directory exceeds the configured safety limit.")
             start += len(resources)
@@ -88,8 +150,18 @@ class ScimClient:
                 break
         return index_users(users)
 
+    def discovery(self):
+        response = self.client.get("Schemas")
+        response.raise_for_status()
+        schemas = response.json().get("Resources", [])
+        users = self.users()
+        return {"schemas": schemas, "attributes": [
+            {"name": name, "samples": values[:3]} for name, values in sorted(self.discovered_attributes.items())
+        ], "users": len(users)}
+
     def write(self, user, existing=None):
-        document = scim_document(user, existing.get("_raw") if existing else None)
+        document = scim_document(user, existing.get("_raw") if existing else None,
+                                 self.settings.attribute_mappings)
         if existing:
             if not existing.get("_id"):
                 raise ValueError("SCIM user has no stable identifier.")
@@ -110,6 +182,7 @@ class LdapClient:
             raise ValueError("LDAP endpoint, bind credentials, and user base DN are required.")
         self.settings = settings
         self.connection = None
+        self.discovered_attributes = {}
 
     def __enter__(self):
         parsed = urlparse(self.settings.ldap_url)
@@ -138,29 +211,82 @@ class LdapClient:
             if entry["type"] != "searchResEntry":
                 continue
             attrs = entry["attributes"]
-
-            def value(name):
-                found = attrs.get(name, "")
-                return str(found[0] if isinstance(found, list) and found else found or "")
-
-            users.append({**canonical({"userName": value("uid"), "givenName": value("givenName"),
-                                       "familyName": value("sn"), "displayName": value("displayName") or value("cn"),
-                                       "email": value("mail")}), "_dn": entry["dn"]})
+            for name, value in attrs.items():
+                if not sensitive_attribute(name):
+                    samples = value if isinstance(value, list) else [value]
+                    bucket = self.discovered_attributes.setdefault(name, [])
+                    for sample in samples:
+                        sample = str(sample)
+                        if sample and sample not in bucket and len(bucket) < 3:
+                            bucket.append(sample)
+            user = canonical({})
+            for mapping in self.settings.attribute_mappings:
+                attribute = mapping.ldap_attribute
+                found = next((value for name, value in attrs.items() if name.casefold() == attribute.casefold()), "")
+                if isinstance(found, list):
+                    found = [str(value) for value in found]
+                else:
+                    found = str(found or "")
+                assign_mapping(user, mapping.scim_path, found)
+            if not user.get("displayName"):
+                user["displayName"] = user.get("userName", "")
+            users.append({**user, "_dn": entry["dn"]})
             if len(users) > MAX_USERS:
                 raise ValueError("Directory exceeds the configured safety limit.")
         if self.connection.result.get("result", 0) != 0:
             raise ValueError("Incomplete LDAP search; reconciliation stopped.")
         return index_users(users)
 
+    def discovery(self):
+        users = self.users()
+        return {"schemas": [], "attributes": [
+            {"name": name, "samples": values} for name, values in sorted(self.discovered_attributes.items())
+        ], "users": len(users)}
+
     def write(self, user, existing=None):
         if not user["familyName"]:
             raise ValueError("inetOrgPerson requires a nonempty familyName (sn).")
-        attrs = {"cn": user["displayName"] or user["userName"], "sn": user["familyName"],
-                 "givenName": user["givenName"], "displayName": user["displayName"], "mail": user["email"]}
+        attrs = {}
+        for mapping in self.settings.attribute_mappings:
+            if mapping.direction not in ("both", "scim_to_ldap"):
+                continue
+            value = mapped_value(user, mapping.scim_path)
+            if value not in (None, ""):
+                attrs[mapping.ldap_attribute] = value if isinstance(value, list) else [str(value)]
+            elif existing:
+                attrs[mapping.ldap_attribute] = []
+        username = user["userName"]
+        attrs.setdefault("cn", [user["displayName"] or username])
+        attrs.setdefault("sn", [user["familyName"]])
         if existing:
-            changes = {field: [(MODIFY_REPLACE, [value] if value else [])] for field, value in attrs.items()}
+            changes = {field: [(MODIFY_REPLACE, value)] for field, value in attrs.items()}
             self.connection.modify(existing["_dn"], changes)
         else:
-            dn = f"uid={escape_rdn(user['userName'])},{self.settings.ldap_base_dn}"
+            username_attribute = next(mapping.ldap_attribute for mapping in self.settings.attribute_mappings
+                                      if mapping.scim_path == "userName")
+            dn = f"{username_attribute}={escape_rdn(username)},{self.settings.ldap_base_dn}"
             self.connection.add(dn, ["top", "person", "organizationalPerson", "inetOrgPerson"],
-                                {"uid": user["userName"], **{key: value for key, value in attrs.items() if value}})
+                                {**attrs, username_attribute: [username]})
+
+
+def sensitive_attribute(name):
+    normalized = name.casefold().split(";")[0]
+    return any(term in normalized for term in (
+        "password", "pwd", "credential", "secret", "token", "privatekey", "krbprincipalkey"))
+
+
+def collect_attribute_samples(value, samples, prefix=""):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if sensitive_attribute(key):
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            collect_attribute_samples(item, samples, path)
+    elif isinstance(value, list):
+        for item in value:
+            collect_attribute_samples(item, samples, prefix)
+    elif prefix:
+        bucket = samples.setdefault(prefix, [])
+        text = str(value)
+        if text and text not in bucket and len(bucket) < 3:
+            bucket.append(text)

@@ -130,6 +130,36 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["totalResults"], 1)
         self.assertEqual(response.json()["Resources"][0]["userName"], "ada")
 
+    def test_scim_discovery_describes_user_resource_and_schemas(self):
+        provider = self.client.get("/scim/v2/ServiceProviderConfig", headers=SCIM_HEADERS).json()
+        self.assertTrue(provider["filter"]["supported"])
+        self.assertEqual(provider["filter"]["maxResults"], 1000)
+        schemas = self.client.get("/scim/v2/Schemas", headers=SCIM_HEADERS).json()
+        self.assertIn("urn:ietf:params:scim:schemas:core:2.0:User",
+                      [item["id"] for item in schemas["Resources"]])
+        resources = self.client.get("/scim/v2/ResourceTypes", headers=SCIM_HEADERS).json()
+        self.assertEqual(resources["Resources"][0]["endpoint"], "/Users")
+        self.assertEqual(self.client.get("/scim/v2/ResourceTypes/Group", headers=SCIM_HEADERS).status_code, 404)
+
+    def test_user_resources_include_meta_and_full_filter_support(self):
+        with patch("bridge.app.LdapClient") as connector:
+            connector.return_value.__enter__.return_value.users.return_value = {"ada": ADA}
+            response = self.client.get('/scim/v2/Users?filter=name.familyName%20eq%20%22Lovelace%22',
+                                       headers=SCIM_HEADERS)
+        self.assertEqual(response.status_code, 200)
+        user = response.json()["Resources"][0]
+        self.assertEqual(user["meta"]["resourceType"], "User")
+        self.assertTrue(user["meta"]["location"].endswith("/scim/v2/Users/YWRh"))
+
+    def test_mapping_settings_reject_duplicate_or_sensitive_attributes(self):
+        response = self.client.put("/api/settings", headers=HEADERS, json={
+            "attribute_mappings": [
+                {"scim_path": "userName", "ldap_attribute": "uid"},
+                {"scim_path": "displayName", "ldap_attribute": "userPassword"},
+            ],
+        })
+        self.assertEqual(response.status_code, 400)
+
     def test_inbound_dry_run_blocks_writes(self):
         response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
                                    json={"userName": "ada", "name": {"familyName": "Lovelace"}})

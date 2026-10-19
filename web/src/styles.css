@@ -134,6 +134,14 @@ input[type="checkbox"] { width: 17px; height: 17px; accent-color: #3477ec; flex-
 .warning-text { font-size: 11px; color: #ac752c; padding: 0 23px 20px; }
 .settings-fields .panel > .notice { margin-inline: 23px; }
 .body-copy { margin: 0 23px 20px; font-size: 12px; color: #7e8ba0; line-height: 1.9; }
+.mapping-discovery { margin: 0 23px 20px; }
+.mapping-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(160px, 1fr) minmax(150px, .8fr) auto; align-items: end; gap: 8px; }
+.mapping-row .field { min-width: 0; }
+.mapping-row > button { margin: 0 23px 22px 0; }
+.mapping-discovery-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin: 0 23px 22px; font-size: 12px; }
+.mapping-discovery-results ul { list-style: none; padding: 0; max-height: 220px; overflow: auto; }
+.mapping-discovery-results li { display: flex; flex-direction: column; gap: 3px; padding: 7px 0; border-bottom: 1px solid #e9edf3; overflow-wrap: anywhere; }
+.mapping-discovery-results small { color: #7e8ba0; }
 .save-bar { background: white; border: 1px solid #e1e7f1; border-radius: 8px; padding: 19px 23px; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 25px; }
 .save-bar > span { font-size: 12px; font-weight: 500; }
 .save-bar small { display: block; font-size: 10px; font-weight: 400; margin-top: 4px; }
@@ -193,6 +201,7 @@ code { font-size: 11px; color: #4d6a97; overflow-wrap: anywhere; }
 }
 @media (max-width: 900px) {
   .two-columns { grid-template-columns: 1fr; gap: 0; }
+  .mapping-row { grid-template-columns: 1fr 1fr; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar-right { font-size: 0; gap: 0; }
   .avatar { font-size: 11px; }
@@ -203,6 +212,9 @@ code { font-size: 11px; color: #4d6a97; overflow-wrap: anywhere; }
   .login-points { flex-wrap: wrap; gap: 16px; }
 }
 @media (max-width: 640px) {
+  .mapping-row { grid-template-columns: 1fr; gap: 0; }
+  .mapping-row > button { justify-self: end; margin-top: -12px; }
+  .mapping-discovery-results { grid-template-columns: 1fr; }
   .app-shell { flex-direction: column; }
   .sidebar { position: static; width: 100%; padding: 17px 16px 0; }
   .brand { font-size: 25px; padding: 0 5px; }

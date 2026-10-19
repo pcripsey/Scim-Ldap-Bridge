@@ -5,7 +5,10 @@ FIELDS = ("userName", "givenName", "familyName", "displayName", "email")
 
 
 def canonical(user):
-    return {field: str(user.get(field) or "") for field in FIELDS}
+    result = {field: str(user.get(field) or "") for field in FIELDS}
+    if user.get("_mapped"):
+        result["_mapped"] = user["_mapped"]
+    return result
 
 
 @dataclass
