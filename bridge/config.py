@@ -14,8 +14,11 @@ class AttributeMapping(BaseModel):
     @field_validator("scim_path")
     @classmethod
     def validate_scim_path(cls, value):
+        parts = re.split(r"[.:]", value.casefold())
         if (not re.fullmatch(r"[A-Za-z][A-Za-z0-9_:.-]*", value)
-                or any(part in {"id", "meta", "schemas", "groups", "password"} for part in value.split("."))):
+                or any(part in {"id", "meta", "schemas", "groups", "active"}
+                       or any(term in part for term in ("password", "credential", "secret", "token", "privatekey"))
+                       for part in parts)):
             raise ValueError("SCIM paths must reference writable, non-sensitive attributes.")
         return value
 
@@ -63,10 +66,9 @@ class Settings(BaseModel):
         attributes = [item.ldap_attribute.casefold() for item in self.attribute_mappings]
         if len(paths) != len(set(paths)) or len(attributes) != len(set(attributes)):
             raise ValueError("SCIM paths and LDAP attributes must each be unique in the mapping.")
-        if "username" not in paths:
+        if not any(item.scim_path == "userName" for item in self.attribute_mappings):
             raise ValueError("A userName mapping is required to identify users.")
-        username_mapping = next(item for item in self.attribute_mappings
-                                if item.scim_path.casefold() == "username")
+        username_mapping = next(item for item in self.attribute_mappings if item.scim_path == "userName")
         if username_mapping.direction != "both":
             raise ValueError("The userName mapping must be enabled in both directions.")
         for value, schemes in ((self.scim_url, ("https", "http")),

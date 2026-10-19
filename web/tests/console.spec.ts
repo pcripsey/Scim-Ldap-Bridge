@@ -62,7 +62,7 @@ async function environment(page: Page, overrides: Partial<Settings> = {}) {
     if (url.pathname.startsWith('/api/discovery/')) {
       const connector = url.pathname.split('/').at(-1);
       await route.fulfill({ json: {
-        schemas: [], users: 1,
+        schemas: [], resource_types: [], users: 1,
         attributes: connector === 'scim'
           ? [{ name: 'name.givenName', samples: ['Ada'] }, { name: 'employeeNumber', samples: ['42'] }]
           : [{ name: 'givenName', samples: ['Ada'] }, { name: 'employeeNumber', samples: ['42'] }],
@@ -172,6 +172,8 @@ test('discovers attributes and saves editable mappings', async ({ page }) => {
   await expect(page.getByText('employeeNumber', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Discover LDAP attributes' }).click();
   await expect(page.getByText('givenName', { exact: true }).last()).toBeVisible();
+  await page.getByRole('button', { name: 'Preview mapping' }).click();
+  await expect(page.getByRole('table').getByText('Ada', { exact: true })).toBeVisible();
   await page.getByLabel('SCIM path 5').fill('employeeNumber');
   await page.getByLabel('LDAP attribute 5').fill('employeeNumber');
   await page.getByRole('button', { name: 'Save configuration' }).click();

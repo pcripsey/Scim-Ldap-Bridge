@@ -147,6 +147,7 @@ function Console({ session, onLogout }: {
   const [draft, setDraft] = useState(session.settings);
   const [secrets, setSecrets] = useState(emptySecrets);
   const [discovery, setDiscovery] = useState<Partial<Record<'scim' | 'ldap', AttributeDiscovery>>>({});
+  const [showMappingPreview, setShowMappingPreview] = useState(false);
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState<{ text: string; kind: string } | null>(null);
   const [pollError, setPollError] = useState('');
@@ -210,6 +211,14 @@ function Console({ session, onLogout }: {
 
   function save(event: FormEvent) {
     event.preventDefault();
+    const paths = draft.attribute_mappings.map(mapping => mapping.scim_path.trim().toLowerCase());
+    const attributes = draft.attribute_mappings.map(mapping => mapping.ldap_attribute.trim().toLowerCase());
+    if (paths.some(path => !path) || attributes.some(attribute => !attribute) ||
+        new Set(paths).size !== paths.length || new Set(attributes).size !== attributes.length ||
+        !draft.attribute_mappings.some(mapping => mapping.scim_path.trim() === 'userName' && mapping.direction === 'both')) {
+      setNotice({ text: 'Mappings must be complete and unique, and userName must be mapped in both directions.', kind: 'error' });
+      return;
+    }
     const warnings: string[] = [];
     if (!draft.dry_run && (saved.dry_run || (!saved.enabled && draft.enabled))) {
       warnings.push('Live mode allows writes to your directories, including inbound SCIM provisioning. Enabling the schedule will run automatically.');
@@ -357,6 +366,18 @@ function Console({ session, onLogout }: {
           <datalist id="scim-attribute-options">{(discovery.scim?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <datalist id="ldap-attribute-options">{(discovery.ldap?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <div className="button-row mapping-discovery"><button type="button" onClick={() => update('attribute_mappings', [...draft.attribute_mappings, { scim_path: '', ldap_attribute: '', direction: 'both' }])}>Add mapping</button></div>
+          <div className="button-row mapping-discovery"><button type="button" disabled={!discovery.scim || !discovery.ldap}
+            onClick={() => setShowMappingPreview(value => !value)}>{showMappingPreview ? 'Hide mapping preview' : 'Preview mapping'}</button></div>
+          {showMappingPreview && <div className="table-scroll"><table><thead><tr><th>SCIM path</th><th>SCIM sample</th><th>LDAP attribute</th><th>LDAP sample</th><th>Direction</th><th>Projected value</th></tr></thead>
+            <tbody>{draft.attribute_mappings.map((mapping, index) => {
+              const scimSample = discovery.scim?.attributes.find(attribute => attribute.name === mapping.scim_path)?.samples[0] ?? 'No sample';
+              const ldapSample = discovery.ldap?.attributes.find(attribute => attribute.name.toLowerCase() === mapping.ldap_attribute.toLowerCase())?.samples[0] ?? 'No sample';
+              const projected = mapping.direction === 'ldap_to_scim' ? `LDAP → SCIM: ${ldapSample}`
+                : mapping.direction === 'scim_to_ldap' ? `SCIM → LDAP: ${scimSample}`
+                  : `SCIM → LDAP: ${scimSample}; LDAP → SCIM: ${ldapSample}`;
+              return <tr key={`${mapping.scim_path}-${index}`}><td><code>{mapping.scim_path}</code></td><td>{scimSample}</td>
+                <td><code>{mapping.ldap_attribute}</code></td><td>{ldapSample}</td><td>{mapping.direction.replaceAll('_', ' ')}</td><td>{projected}</td></tr>;
+            })}</tbody></table></div>}
           {(discovery.scim || discovery.ldap) && <div className="mapping-discovery-results">
             {(['scim', 'ldap'] as const).map(source => discovery[source] && <div key={source}>
               <strong>{source.toUpperCase()} discovered attributes</strong>

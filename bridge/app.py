@@ -1,7 +1,6 @@
 import base64
 import hmac
 import os
-import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -83,6 +82,9 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     @app.middleware("http")
     async def security_headers(request, call_next):
         response = await call_next(request)
+        if (request.url.path.startswith("/scim/")
+                and response.headers.get("content-type", "").startswith("application/json")):
+            response.headers["Content-Type"] = "application/scim+json"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -237,12 +239,14 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
 
     @app.get("/scim/v2/Schemas", dependencies=[Depends(provisioning)])
     def list_schemas():
-        schemas = [schema.model_dump(mode="json", by_alias=True, exclude_none=True) for schema in catalog.schemas]
+        supported = [schema for schema in catalog.schemas if schema.id in (USER_SCHEMA, ENTERPRISE_SCHEMA)]
+        schemas = [schema.model_dump(mode="json", by_alias=True, exclude_none=True) for schema in supported]
         return {"schemas": [SCIM_LIST], "totalResults": len(schemas), "Resources": schemas}
 
     @app.get("/scim/v2/Schemas/{schema_id:path}", dependencies=[Depends(provisioning)])
     def get_schema(schema_id: str):
-        schema = next((item for item in catalog.schemas if item.id == schema_id), None)
+        schema = next((item for item in catalog.schemas
+                       if item.id in (USER_SCHEMA, ENTERPRISE_SCHEMA) and item.id == schema_id), None)
         if schema is None:
             raise HTTPException(404, "Schema not found.")
         return schema.model_dump(mode="json", by_alias=True, exclude_none=True)

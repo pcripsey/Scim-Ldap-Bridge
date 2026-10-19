@@ -23,6 +23,7 @@ export interface AttributeMapping {
 
 export interface AttributeDiscovery {
   schemas: unknown[];
+  resource_types: unknown[];
   attributes: { name: string; samples: string[] }[];
   users: number;
 }

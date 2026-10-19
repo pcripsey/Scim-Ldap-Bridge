@@ -139,7 +139,21 @@ class ApiTests(unittest.TestCase):
                       [item["id"] for item in schemas["Resources"]])
         resources = self.client.get("/scim/v2/ResourceTypes", headers=SCIM_HEADERS).json()
         self.assertEqual(resources["Resources"][0]["endpoint"], "/Users")
+        self.assertNotIn("Group", [item["name"] for item in resources["Resources"]])
+        self.assertEqual(self.client.get("/scim/v2/Users", headers=SCIM_HEADERS).headers["content-type"],
+                         "application/scim+json")
         self.assertEqual(self.client.get("/scim/v2/ResourceTypes/Group", headers=SCIM_HEADERS).status_code, 404)
+
+    def test_admin_can_discover_saved_connector_attributes(self):
+        with patch("bridge.app.ScimClient") as connector:
+            connector.return_value.__enter__.return_value.discovery.return_value = {
+                "schemas": [], "resource_types": [], "attributes": [{"name": "userName", "samples": ["ada"]}],
+                "users": 1,
+            }
+            response = self.client.post("/api/discovery/scim", headers=HEADERS)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["attributes"][0]["name"], "userName")
+        self.assertEqual(self.client.post("/api/discovery/scim", headers=SCIM_HEADERS).status_code, 401)
 
     def test_user_resources_include_meta_and_full_filter_support(self):
         with patch("bridge.app.LdapClient") as connector:

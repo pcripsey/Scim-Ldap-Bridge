@@ -154,10 +154,20 @@ class ScimClient:
         response = self.client.get("Schemas")
         response.raise_for_status()
         schemas = response.json().get("Resources", [])
-        users = self.users()
-        return {"schemas": schemas, "attributes": [
+        resource_response = self.client.get("ResourceTypes")
+        resource_response.raise_for_status()
+        resource_types = resource_response.json().get("Resources", [])
+        response = self.client.get("Users", params={"startIndex": 1, "count": 10})
+        response.raise_for_status()
+        page = response.json()
+        resources = page.get("Resources", [])
+        if not isinstance(resources, list):
+            raise ValueError("Invalid SCIM list response.")
+        for resource in resources:
+            collect_attribute_samples(resource, self.discovered_attributes)
+        return {"schemas": schemas, "resource_types": resource_types, "attributes": [
             {"name": name, "samples": values[:3]} for name, values in sorted(self.discovered_attributes.items())
-        ], "users": len(users)}
+        ], "users": page.get("totalResults", len(resources))}
 
     def write(self, user, existing=None):
         document = scim_document(user, existing.get("_raw") if existing else None,
@@ -238,10 +248,27 @@ class LdapClient:
         return index_users(users)
 
     def discovery(self):
-        users = self.users()
-        return {"schemas": [], "attributes": [
+        entries = self.connection.extend.standard.paged_search(
+            self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
+            paged_size=200, generator=True)
+        count = 0
+        for entry in entries:
+            if entry["type"] != "searchResEntry":
+                continue
+            count += 1
+            for name, value in entry["attributes"].items():
+                if not sensitive_attribute(name):
+                    values = value if isinstance(value, list) else [value]
+                    bucket = self.discovered_attributes.setdefault(name, [])
+                    for sample in values:
+                        sample = str(sample)
+                        if sample and sample not in bucket and len(bucket) < 3:
+                            bucket.append(sample)
+        if self.connection.result.get("result", 0) != 0:
+            raise ValueError("Incomplete LDAP discovery search.")
+        return {"schemas": [], "resource_types": [], "attributes": [
             {"name": name, "samples": values} for name, values in sorted(self.discovered_attributes.items())
-        ], "users": len(users)}
+        ], "users": count}
 
     def write(self, user, existing=None):
         if not user["familyName"]:

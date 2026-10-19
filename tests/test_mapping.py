@@ -24,7 +24,7 @@ class MappingTests(unittest.TestCase):
         self.assertIn(path.rsplit(":", 1)[0], result["schemas"])
 
     def test_mapping_rejects_sensitive_and_read_only_paths(self):
-        for path in ("password", "meta.version", "groups.value"):
+        for path in ("password", "meta.version", "groups.value", "active"):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 AttributeMapping(scim_path=path, ldap_attribute="description")
         with self.assertRaises(ValueError):
