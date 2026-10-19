@@ -188,12 +188,20 @@ class Store:
     def pending_attempt(self, username, error, conflict=False):
         with self.lock, self.db:
             self.db.execute("UPDATE pending_users SET status=?, attempts=attempts+1, error=?, updated_at=? "
-                            "WHERE username=?", ("conflict" if conflict else "pending", error, timestamp(), username))
+                            "WHERE folded=?", ("conflict" if conflict else "pending", error, timestamp(),
+                                                username.casefold()))
 
     def remove_pending(self, username):
         with self.lock, self.db:
             return self.db.execute("DELETE FROM pending_users WHERE folded=?",
                                    (username.casefold(),)).rowcount == 1
+
+    def present_user(self, source, username):
+        """Whether the last inventory observed a user with this userName, ignoring case."""
+        with self.lock:
+            return any(row[0].casefold() == username.casefold() for row in self.db.execute(
+                "SELECT resource_key FROM resources WHERE source=? AND resource_type='Users' AND present=1",
+                (source,)))
 
     def resource_records(self, source=None, resource_type="Users", limit=100, offset=0):
         with self.lock:
@@ -202,8 +210,9 @@ class Store:
                 "CASE present WHEN 1 THEN 'present' ELSE 'absent' END AS status,"
                 "NULL AS error,NULL AS attempts FROM resources "
                 "WHERE (? IS NULL OR source=?) AND resource_type=? "
-                "UNION ALL SELECT 'inbound','Users',username,updated_at,0,"
-                "CASE status WHEN 'pending' THEN 'waiting_for_ldap' ELSE status END,error,attempts "
+                "UNION ALL SELECT 'inbound' AS source,'Users' AS resource_type,username AS resource_key,"
+                "updated_at AS observed_at,0 AS present,"
+                "CASE status WHEN 'pending' THEN 'waiting_for_ldap' ELSE status END AS status,error,attempts "
                 "FROM pending_users WHERE (? IS NULL OR ?='inbound') AND ?='Users' "
                 "ORDER BY source,resource_key LIMIT ? OFFSET ?",
                 (source, source, resource_type, source, source, resource_type, limit, offset))]

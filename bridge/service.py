@@ -45,7 +45,13 @@ class SyncService:
         revision = self.revision
         while not self.stop.wait(1):
             if time.time() >= pending_due:
-                self.drain_pending()
+                try:
+                    self.drain_pending()
+                except Exception as error:
+                    try:
+                        self.store.event("error", f"Queued SCIM push retry failed ({type(error).__name__}).")
+                    except Exception:
+                        pass
                 pending_due = time.time() + PENDING_RETRY_SECONDS
             settings = self.store.settings()
             if revision != self.revision:
@@ -106,14 +112,18 @@ class SyncService:
         token = correlation_id.set(new_id())
         start = time.perf_counter()
         result = "exception"
+        applied = False
         try:
             with LdapClient(settings) as client:
-                created = self.apply_pending(client, client.users())
+                users = client.users()
+                applied = True
+                created = self.apply_pending(client, users)
             result = "completed"
             return created
         except Exception as error:
-            for username in self.store.pending_users():
-                self.store.pending_attempt(username, type(error).__name__)
+            if not applied:
+                for username in self.store.pending_users():
+                    self.store.pending_attempt(username, type(error).__name__)
             return None
         finally:
             try:

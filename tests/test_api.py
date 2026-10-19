@@ -299,6 +299,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((detail["givenName"], detail["familyName"]), ("Ada", "King"))
         summary = self.client.get("/api/status", headers=HEADERS).json()["database"]
         self.assertEqual(summary["pending_users"], {"pending": 1})
+        self.client.app.state.store.replace_resources("ldap", "Users", {"Grace": ADA})
+        response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                    json={"userName": "grace", "name": {"familyName": "Hopper"}})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.headers[ERROR_HEADER], "uniqueness")
+        self.assertIsNone(self.client.app.state.store.pending_user("grace"))
 
     def test_inbound_create_is_queued_when_ldap_write_fails_and_retried(self):
         self.client.put("/api/settings", headers=HEADERS, json={

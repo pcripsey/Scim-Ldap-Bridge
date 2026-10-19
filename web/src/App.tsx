@@ -391,7 +391,10 @@ function Console({ session, onLogout }: {
       <div className="metrics">
         <Metric label="SCIM USERS" value={status.database.inventory.filter(row => row.source === 'scim' && row.resource_type === 'Users').reduce((sum, row) => sum + row.count, 0)} icon={<Network />} note="Present in last inventory" />
         <Metric label="LDAP USERS" value={status.database.inventory.filter(row => row.source === 'ldap' && row.resource_type === 'Users').reduce((sum, row) => sum + row.count, 0)} icon={<Database />}
-          note={status.database.pending_users?.pending ? `${status.database.pending_users.pending} waiting to be synchronised to LDAP` : 'Present in last inventory'} />
+          note={[
+            status.database.pending_users?.pending ? `${status.database.pending_users.pending} waiting to be synchronised to LDAP` : '',
+            status.database.pending_users?.conflict ? `${status.database.pending_users.conflict} queued in conflict` : '',
+          ].filter(Boolean).join(' / ') || 'Present in last inventory'} />
         <Metric label="LINKED IDENTITIES" value={status.linked_users} icon={<ArrowDownUp />} note="Matching identity baselines" />
         <Metric label="SYNC STATUS" value={status.running ? 'Running' : 'Idle'} icon={<Activity />} note={status.enabled ? `Next: ${date(status.next_run)}` : 'Automatic schedule paused'} />
       </div>

@@ -353,8 +353,9 @@ rejects the write, the request still returns `201 Created` and the user remains
 queued with status `waiting_for_ldap` (plus the last error type and attempt count).
 While live mode is on, the service retries queued users every 30 seconds. Queued
 users are returned by inbound SCIM reads and can be updated with `PUT`/`PATCH`
-until they are created. A queued user whose `userName` already exists in LDAP is
-marked `conflict` and is not retried or overwritten; review it and discard it from
+until they are created. A new user whose `userName` already exists in LDAP is
+rejected with `409` when the last LDAP inventory already contains it; one that is
+only discovered when the queue is retried is marked `conflict` and is not retried or overwritten; review it and discard it from
 Inventory (`DELETE /api/data/pending?key=<userName>`). Queued users are kept when
 connector settings change and are written to the LDAP directory configured when
 they are retried.

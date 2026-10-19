@@ -423,7 +423,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         service, store = app.state.service, app.state.store
         username = user["userName"]
         # The user is stored first and stays queued until LDAP accepts it.
-        if not store.add_pending(user):
+        if store.present_user("ldap", username) or not store.add_pending(user):
             raise HTTPException(409, "userName already exists.", headers={ERROR_HEADER: "uniqueness"})
         settings = store.settings()
         if not settings.dry_run and service.lock.acquire(blocking=False):
