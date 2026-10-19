@@ -69,6 +69,10 @@ async function environment(page: Page, overrides: Partial<Settings> = {}) {
       } });
       return;
     }
+    if (url.pathname === '/api/mappings/validate') {
+      await route.fulfill({ json: { valid: true, errors: [], scim_attributes: 20, ldap_attributes: 20 } });
+      return;
+    }
     if (url.pathname === '/api/sync') { await route.fulfill({ status: 202, json: { run_id: 8 } }); return; }
     if (url.pathname === '/api/data/resources') {
       const offset = Number(url.searchParams.get('offset') ?? 0);
@@ -172,8 +176,10 @@ test('discovers attributes and saves editable mappings', async ({ page }) => {
   await expect(page.getByText('employeeNumber', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Discover LDAP attributes' }).click();
   await expect(page.getByText('givenName', { exact: true }).last()).toBeVisible();
+  await page.getByRole('button', { name: 'Validate mappings' }).click();
+  await expect(page.getByText(/All mappings validated against 20 SCIM paths/)).toBeVisible();
   await page.getByRole('button', { name: 'Preview mapping' }).click();
-  await expect(page.getByRole('table').getByText('Ada', { exact: true })).toBeVisible();
+  await expect(page.getByRole('table').getByText('Ada', { exact: true }).first()).toBeVisible();
   await page.getByLabel('SCIM path 5').fill('employeeNumber');
   await page.getByLabel('LDAP attribute 5').fill('employeeNumber');
   await page.getByRole('button', { name: 'Save configuration' }).click();

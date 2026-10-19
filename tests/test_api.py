@@ -155,6 +155,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["attributes"][0]["name"], "userName")
         self.assertEqual(self.client.post("/api/discovery/scim", headers=SCIM_HEADERS).status_code, 401)
 
+    def test_mapping_validation_checks_both_connector_attribute_sets(self):
+        with patch("bridge.app.ScimClient") as scim, patch("bridge.app.LdapClient") as ldap:
+            scim.return_value.__enter__.return_value.discovery.return_value = {
+                "attributes": [{"name": name} for name in
+                               ("userName", "name.givenName", "name.familyName", "displayName", "emails.value")],
+            }
+            ldap.return_value.__enter__.return_value.discovery.return_value = {
+                "attributes": [{"name": name} for name in ("uid", "givenName", "sn", "displayName", "mail")],
+            }
+            response = self.client.post("/api/mappings/validate", headers=HEADERS, json={
+                "attribute_mappings": self.client.get("/api/settings", headers=HEADERS).json()["attribute_mappings"],
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["valid"])
+        self.assertEqual(response.json()["scim_attributes"], 5)
+
     def test_user_resources_include_meta_and_full_filter_support(self):
         with patch("bridge.app.LdapClient") as connector:
             connector.return_value.__enter__.return_value.users.return_value = {"ada": ADA}
@@ -163,6 +179,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         user = response.json()["Resources"][0]
         self.assertEqual(user["meta"]["resourceType"], "User")
+        self.assertTrue(user["meta"]["location"].startswith("http://testserver/scim/v2/Users/"))
         self.assertTrue(user["meta"]["location"].endswith("/scim/v2/Users/YWRh"))
 
     def test_mapping_settings_reject_duplicate_or_sensitive_attributes(self):

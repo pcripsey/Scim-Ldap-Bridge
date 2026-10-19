@@ -24,8 +24,15 @@ export interface AttributeMapping {
 export interface AttributeDiscovery {
   schemas: unknown[];
   resource_types: unknown[];
-  attributes: { name: string; samples: string[] }[];
+  attributes: { name: string; type?: string; multi_valued?: boolean | null; samples: string[] }[];
   users: number;
+}
+
+export interface MappingValidation {
+  valid: boolean;
+  errors: { scim_path?: string; ldap_attribute?: string; message: string }[];
+  scim_attributes: number;
+  ldap_attributes: number;
 }
 
 export interface Run {

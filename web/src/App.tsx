@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import {
   ApiError, message, request, settingsPayload,
-  type AttributeDiscovery, type Event, type Operation, type Resource, type Run, type SecretEdit,
+  type AttributeDiscovery, type Event, type MappingValidation, type Operation, type Resource, type Run, type SecretEdit,
   type Secrets, type Settings, type Status,
 } from './api';
 
@@ -257,6 +257,18 @@ function Console({ session, onLogout }: {
     });
   }
 
+  function validateMappings() {
+    void action('validate-mappings', async () => {
+      const result = await api<MappingValidation>('/api/mappings/validate', {
+        method: 'POST', body: JSON.stringify({ attribute_mappings: draft.attribute_mappings }),
+      });
+      if (!result.valid) {
+        throw new Error(result.errors.map(item => `${item.scim_path ?? item.ldap_attribute}: ${item.message}`).join('; '));
+      }
+      return `All mappings validated against ${result.scim_attributes} SCIM paths and ${result.ldap_attributes} LDAP attributes.`;
+    });
+  }
+
   function sync() {
     if (!status.dry_run && !window.confirm('Start a live synchronization? This can write changes to your configured directories.')) return;
     void action('sync', async () => {
@@ -338,7 +350,7 @@ function Console({ session, onLogout }: {
           </Panel>
         </div>
         <Panel title="Attribute mapping" subtitle="Map SCIM paths to LDAP attributes. Discovery uses saved, read-only connections.">
-          <p className="body-copy">The userName mapping identifies accounts. Passwords and other sensitive attributes are excluded from discovery.</p>
+          <p className="body-copy">The userName mapping identifies accounts. Passwords and other sensitive attributes are excluded from discovery. Validation uses saved connector settings.</p>
           <div className="button-row mapping-discovery">
             <button type="button" disabled={dirty || !saved.scim_url || !saved.scim_token_configured || Boolean(busy)}
               onClick={() => discover('scim')}>{busy === 'discover-scim' ? 'Discovering SCIM...' : 'Discover SCIM attributes'}</button>
@@ -366,6 +378,8 @@ function Console({ session, onLogout }: {
           <datalist id="scim-attribute-options">{(discovery.scim?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <datalist id="ldap-attribute-options">{(discovery.ldap?.attributes ?? []).map(attribute => <option key={attribute.name} value={attribute.name} />)}</datalist>
           <div className="button-row mapping-discovery"><button type="button" onClick={() => update('attribute_mappings', [...draft.attribute_mappings, { scim_path: '', ldap_attribute: '', direction: 'both' }])}>Add mapping</button></div>
+          <div className="button-row mapping-discovery"><button type="button" disabled={!saved.scim_url || !saved.scim_token_configured || !saved.ldap_url || !saved.ldap_base_dn || !saved.ldap_bind_dn || !saved.ldap_password_configured || Boolean(busy)}
+            onClick={validateMappings}>{busy === 'validate-mappings' ? 'Validating...' : 'Validate mappings'}</button></div>
           <div className="button-row mapping-discovery"><button type="button" disabled={!discovery.scim || !discovery.ldap}
             onClick={() => setShowMappingPreview(value => !value)}>{showMappingPreview ? 'Hide mapping preview' : 'Preview mapping'}</button></div>
           {showMappingPreview && <div className="table-scroll"><table><thead><tr><th>SCIM path</th><th>SCIM sample</th><th>LDAP attribute</th><th>LDAP sample</th><th>Direction</th><th>Projected value</th></tr></thead>
@@ -382,6 +396,7 @@ function Console({ session, onLogout }: {
             {(['scim', 'ldap'] as const).map(source => discovery[source] && <div key={source}>
               <strong>{source.toUpperCase()} discovered attributes</strong>
               <ul>{discovery[source]!.attributes.map(attribute => <li key={attribute.name}><code>{attribute.name}</code>
+                <small>{attribute.type ?? 'type unavailable'} / {attribute.multi_valued === undefined || attribute.multi_valued === null ? 'multiplicity unavailable' : attribute.multi_valued ? 'multi-valued' : 'single-valued'}</small>
                 {attribute.samples.length > 0 && <small>Sample: {attribute.samples.join(', ')}</small>}</li>)}</ul>
             </div>)}
           </div>}

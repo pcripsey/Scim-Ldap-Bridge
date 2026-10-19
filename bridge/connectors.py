@@ -27,7 +27,7 @@ def index_users(users):
 def mapping_parts(path):
     if path.startswith("urn:") and ":" in path:
         schema, attribute = path.rsplit(":", 1)
-        return schema, attribute
+        return (schema, *attribute.split("."))
     return tuple(path.split("."))
 
 
@@ -53,6 +53,10 @@ def assign_mapping(user, path, value):
             value = value[0] if value else ""
         user[field] = str(value or "")
     else:
+        if isinstance(value, list):
+            if len(value) > 1:
+                raise ValueError(f"Multi-valued SCIM attribute '{path}' requires a dedicated mapping.")
+            value = value[0] if value else ""
         user.setdefault("_mapped", {})[path] = value
 
 
@@ -165,8 +169,11 @@ class ScimClient:
             raise ValueError("Invalid SCIM list response.")
         for resource in resources:
             collect_attribute_samples(resource, self.discovered_attributes)
+        details = schema_attribute_details(schemas)
+        names = set(details) | set(self.discovered_attributes)
         return {"schemas": schemas, "resource_types": resource_types, "attributes": [
-            {"name": name, "samples": values[:3]} for name, values in sorted(self.discovered_attributes.items())
+            {"name": name, **details.get(name, {}), "samples": self.discovered_attributes.get(name, [])[:3]}
+            for name in sorted(names)
         ], "users": page.get("totalResults", len(resources))}
 
     def write(self, user, existing=None):
@@ -175,8 +182,18 @@ class ScimClient:
         if existing:
             if not existing.get("_id"):
                 raise ValueError("SCIM user has no stable identifier.")
-            operations = [{"op": "replace", "path": field, "value": document[field]}
-                          for field in ("displayName", "name", "emails")]
+            operations = []
+            for mapping in self.settings.attribute_mappings:
+                if mapping.direction not in ("both", "ldap_to_scim"):
+                    continue
+                path = mapping.scim_path
+                if path == "userName":
+                    continue
+                patch_path = "emails" if path == "emails.value" else path
+                if any(operation["path"] == patch_path for operation in operations):
+                    continue
+                value = document.get("emails", []) if path == "emails.value" else scim_value(document, path)
+                operations.append({"op": "replace", "path": patch_path, "value": value})
             response = self.client.patch("Users/" + quote(str(existing["_id"]), safe=""),
                                          json={"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
                                                "Operations": operations},
@@ -234,6 +251,8 @@ class LdapClient:
                 attribute = mapping.ldap_attribute
                 found = next((value for name, value in attrs.items() if name.casefold() == attribute.casefold()), "")
                 if isinstance(found, list):
+                    if mapping.scim_path != "emails.value" and len(found) > 1:
+                        raise ValueError(f"Multi-valued LDAP attribute '{attribute}' requires a dedicated mapping.")
                     found = [str(value) for value in found]
                 else:
                     found = str(found or "")
@@ -267,7 +286,8 @@ class LdapClient:
         if self.connection.result.get("result", 0) != 0:
             raise ValueError("Incomplete LDAP discovery search.")
         return {"schemas": [], "resource_types": [], "attributes": [
-            {"name": name, "samples": values} for name, values in sorted(self.discovered_attributes.items())
+            {"name": name, "type": "unknown", "multi_valued": None, "samples": values}
+            for name, values in sorted(self.discovered_attributes.items())
         ], "users": count}
 
     def write(self, user, existing=None):
@@ -305,9 +325,15 @@ def sensitive_attribute(name):
 def collect_attribute_samples(value, samples, prefix=""):
     if isinstance(value, dict):
         for key, item in value.items():
-            if sensitive_attribute(key):
+            if (sensitive_attribute(key)
+                    or key.casefold() in {"id", "meta", "schemas", "groups", "active"}):
                 continue
-            path = f"{prefix}.{key}" if prefix else key
+            if not prefix:
+                path = key
+            elif prefix.startswith("urn:") and prefix.rsplit(":", 1)[-1] in ("User", "Group"):
+                path = f"{prefix}:{key}"
+            else:
+                path = f"{prefix}.{key}"
             collect_attribute_samples(item, samples, path)
     elif isinstance(value, list):
         for item in value:
@@ -317,3 +343,27 @@ def collect_attribute_samples(value, samples, prefix=""):
         text = str(value)
         if text and text not in bucket and len(bucket) < 3:
             bucket.append(text)
+
+
+def schema_attribute_details(schemas):
+    details = {}
+
+    def visit(schema_id, attributes, parent="", parent_multi=False):
+        for attribute in attributes or []:
+            name = attribute.get("name")
+            if (not name or str(attribute.get("mutability", "")).casefold() in ("readonly", "immutable")
+                    or attribute.get("returned") == "never"
+                    or name.casefold() in {"id", "meta", "schemas", "groups", "active"}
+                    or sensitive_attribute(name)):
+                continue
+            prefix = f"{parent}.{name}" if parent else (
+                f"{schema_id}:{name}" if schema_id.startswith("urn:") and schema_id != "urn:ietf:params:scim:schemas:core:2.0:User" else name)
+            multi = parent_multi or bool(attribute.get("multiValued", False))
+            if attribute.get("type") != "complex":
+                details[prefix] = {"type": attribute.get("type", "unknown"), "multi_valued": multi}
+            visit(schema_id, attribute.get("subAttributes"), prefix, multi)
+
+    for schema in schemas:
+        if isinstance(schema, dict):
+            visit(schema.get("id", ""), schema.get("attributes", []))
+    return details

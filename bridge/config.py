@@ -14,7 +14,8 @@ class AttributeMapping(BaseModel):
     @field_validator("scim_path")
     @classmethod
     def validate_scim_path(cls, value):
-        parts = re.split(r"[.:]", value.casefold())
+        attribute_path = value.rsplit(":", 1)[-1] if value.startswith("urn:") else value
+        parts = re.split(r"[.:]", attribute_path.casefold())
         if (not re.fullmatch(r"[A-Za-z][A-Za-z0-9_:.-]*", value)
                 or any(part in {"id", "meta", "schemas", "groups", "active"}
                        or any(term in part for term in ("password", "credential", "secret", "token", "privatekey"))

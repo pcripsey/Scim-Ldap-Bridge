@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import Mock
 
 from bridge.config import AttributeMapping, DEFAULT_ATTRIBUTE_MAPPINGS
-from bridge.connectors import from_scim, scim_document
+from bridge.connectors import (ScimClient, collect_attribute_samples, from_scim,
+                               schema_attribute_details, scim_document)
 from bridge.planner import canonical
 
 
@@ -30,6 +32,29 @@ class MappingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AttributeMapping(scim_path="displayName", ldap_attribute="userPassword")
 
+    def test_arbitrary_multivalued_mapping_is_rejected(self):
+        mapping = AttributeMapping(scim_path="employeeNumber", ldap_attribute="employeeNumber")
+        with self.assertRaises(ValueError):
+            from_scim({"userName": "ada", "employeeNumber": ["42", "43"]},
+                      [*DEFAULT_ATTRIBUTE_MAPPINGS, mapping])
+
+    def test_discovery_describes_schema_paths_and_excludes_secrets(self):
+        extension = "urn:example:params:scim:schemas:extension:custom:2.0:User"
+        details = schema_attribute_details([
+            {"id": "urn:ietf:params:scim:schemas:core:2.0:User", "attributes": [
+                {"name": "emails", "type": "complex", "multiValued": True,
+                 "subAttributes": [{"name": "value", "type": "string", "multiValued": False}]},
+            ]},
+            {"id": extension, "attributes": [
+                {"name": "costCode", "type": "string", "multiValued": False},
+            ]},
+        ])
+        self.assertEqual(details["emails.value"], {"type": "string", "multi_valued": True})
+        self.assertEqual(details[extension + ":costCode"]["type"], "string")
+        samples = {}
+        collect_attribute_samples({extension: {"costCode": "42", "password": "secret"}}, samples)
+        self.assertEqual(samples, {extension + ":costCode": ["42"]})
+
     def test_email_mapping_preserves_primary_value(self):
         user = from_scim({
             "userName": "ada",
@@ -39,6 +64,27 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(user["email"], "ada@example.org")
         output = scim_document(user)
         self.assertEqual(output["emails"], [{"value": "ada@example.org", "type": "work", "primary": True}])
+
+    def test_custom_mapping_is_written_to_remote_scim(self):
+        from bridge.config import Settings
+
+        mappings = [AttributeMapping.model_validate(item) for item in DEFAULT_ATTRIBUTE_MAPPINGS]
+        mappings.append(AttributeMapping(scim_path="employeeNumber", ldap_attribute="employeeNumber"))
+        client = ScimClient(Settings(scim_url="https://example.org/scim/v2", scim_token="x" * 24,
+                                     attribute_mappings=mappings))
+        response = Mock()
+        response.raise_for_status.return_value = None
+        client.client.patch = Mock(return_value=response)
+        try:
+            user = from_scim({
+                "userName": "ada", "name": {"givenName": "Ada", "familyName": "Lovelace"},
+                "employeeNumber": "042",
+            }, mappings)
+            client.write(user, {"_id": "resource-1", "_raw": {"userName": "ada"}})
+            operations = client.client.patch.call_args.kwargs["json"]["Operations"]
+            self.assertIn({"op": "replace", "path": "employeeNumber", "value": "042"}, operations)
+        finally:
+            client.client.close()
 
 
 if __name__ == "__main__":

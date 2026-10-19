@@ -189,6 +189,34 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         except Exception as error:
             raise HTTPException(502, f"Attribute discovery failed ({type(error).__name__}). Check credentials, TLS, endpoint, and read permissions.") from None
 
+    @app.post("/api/mappings/validate", dependencies=[Depends(admin)])
+    def validate_mappings(payload: dict = Body(...)):
+        try:
+            settings = Settings.model_validate({
+                **app.state.store.settings().model_dump(),
+                "attribute_mappings": payload.get("attribute_mappings"),
+            })
+        except ValidationError as error:
+            messages = [item["msg"] for item in error.errors(include_input=False, include_context=False)]
+            raise HTTPException(400, "; ".join(messages)) from None
+        try:
+            with ScimClient(settings) as scim_client:
+                scim = scim_client.discovery()
+            with LdapClient(settings) as ldap_client:
+                ldap = ldap_client.discovery()
+        except Exception as error:
+            raise HTTPException(502, f"Mapping validation could not inspect both connectors ({type(error).__name__}).") from None
+        scim_names = {item["name"].casefold() for item in scim["attributes"]}
+        ldap_names = {item["name"].casefold() for item in ldap["attributes"]}
+        errors = []
+        for mapping in settings.attribute_mappings:
+            if mapping.scim_path.casefold() not in scim_names:
+                errors.append({"scim_path": mapping.scim_path, "message": "Path was not discovered in the SCIM schema or sample resources."})
+            if mapping.ldap_attribute.casefold() not in ldap_names:
+                errors.append({"ldap_attribute": mapping.ldap_attribute, "message": "Attribute was not found in the LDAP search base."})
+        return {"valid": not errors, "errors": errors, "scim_attributes": len(scim_names),
+                "ldap_attributes": len(ldap_names)}
+
     def directory_operation(callback, write=False):
         service, store = app.state.service, app.state.store
         if not service.lock.acquire(blocking=False):
@@ -223,7 +251,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             raise HTTPException(400, "Account status, passwords, and group provisioning are not supported by this mapping.")
         try:
             user = from_scim(document, app.state.store.settings().attribute_mappings)
-        except (AttributeError, TypeError, KeyError):
+        except (AttributeError, TypeError, KeyError, ValueError):
             raise HTTPException(400, "Invalid SCIM attribute types.") from None
         if not user["familyName"]:
             raise HTTPException(400, "name.familyName is required by the inetOrgPerson schema.")
@@ -267,19 +295,22 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
         return list_resource_types()["Resources"][0]
 
     @app.get("/scim/v2/Users", dependencies=[Depends(provisioning)])
-    def list_users(startIndex: int = Query(1, ge=1), count: int = Query(100, ge=0, le=1000), filter: str | None = None):
+    def list_users(request: Request, startIndex: int = Query(1, ge=1), count: int = Query(100, ge=0, le=1000),
+                   filter: str | None = None):
         def read(client, users):
             selected = sorted(users.values(), key=lambda item: item["userName"])
             mappings = app.state.store.settings().attribute_mappings
             if filter:
                 try:
                     selected = [user for user in selected
-                                if catalog.matches("Users", resource(user, mappings), filter)]
+                                if catalog.matches("Users", resource(user, mappings,
+                                                                     str(request.base_url).rstrip("/")), filter)]
                 except (ValueError, TypeError, KeyError):
                     raise HTTPException(400, "Invalid or unsupported SCIM filter.") from None
             page = selected[startIndex - 1:startIndex - 1 + count]
             return {"schemas": [SCIM_LIST], "totalResults": len(selected), "startIndex": startIndex,
-                    "itemsPerPage": len(page), "Resources": [resource(user, mappings) for user in page]}
+                    "itemsPerPage": len(page), "Resources": [
+                        resource(user, mappings, str(request.base_url).rstrip("/")) for user in page]}
         return directory_operation(read)
 
     @app.get("/scim/v2/Users/{identifier}", dependencies=[Depends(provisioning)])

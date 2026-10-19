@@ -214,10 +214,13 @@ pagination capped at 1,000 results per page. User responses include `meta.resour
 and `meta.location`. Inbound writes are blocked during dry runs. The advertised feature
 set intentionally excludes bulk, sorting, ETags, and password changes.
 
-The console's **Attribute mapping** section can discover SCIM schemas/resource types
-and LDAP attribute names and samples, excluding sensitive-looking attributes. Map
-SCIM paths to LDAP attributes with per-rule directions, inspect a sample comparison,
-and save the mapping with the rest of the encrypted settings. Defaults map `userName`
+The console's **Attribute mapping** section can discover SCIM schemas/resource types,
+attribute type/multiplicity metadata when the SCIM schema provides it, and LDAP
+attribute names and samples (LDAP type/multiplicity is reported as unavailable).
+Sensitive-looking attributes are excluded. Map SCIM paths to LDAP attributes with
+per-rule directions, validate mappings against both connected sources, inspect a
+sample comparison, and save the mapping with the rest of the encrypted settings.
+Defaults map `userName`
 to `uid`, names to `givenName`/`sn`, `displayName` to `displayName`, and primary email
 to `mail`. SCIM paths are simple dotted paths, with extension attributes addressable
 by their full extension URN and attribute name. Mapping values are copied as-is; this
