@@ -265,11 +265,102 @@ class ApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
 
-    def test_inbound_dry_run_blocks_writes(self):
+    def test_inbound_dry_run_queues_users_without_writing(self):
+        with patch("bridge.app.LdapClient") as connector:
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                        json={"userName": "ada", "name": {"familyName": "Lovelace"}})
+            self.assertEqual(response.status_code, 201)
+            identifier = response.json()["id"]
+            self.assertEqual(self.client.get(f"/scim/v2/Users/{identifier}", headers=SCIM_HEADERS)
+                             .json()["name"]["familyName"], "Lovelace")
+            response = self.client.patch(f"/scim/v2/Users/{identifier}", headers=SCIM_HEADERS,
+                                         json={"Operations": [{"op": "replace", "path": "name.givenName",
+                                                               "value": "Augusta"}]})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["name"]["givenName"], "Augusta")
+            response = self.client.put(f"/scim/v2/Users/{identifier}", headers=SCIM_HEADERS,
+                                       json={"userName": "ada", "name": {"givenName": "Ada", "familyName": "King"}})
+            self.assertEqual(response.status_code, 200)
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                        json={"userName": "ADA", "name": {"familyName": "Lovelace"}})
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.headers[ERROR_HEADER], "uniqueness")
+            connector.assert_not_called()
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {}
+            response = self.client.put(f"/scim/v2/Users/{opaque_id('bob')}", headers=SCIM_HEADERS,
+                                       json={"userName": "bob", "name": {"familyName": "Builder"}})
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.headers[ERROR_HEADER], "dry_run")
+            directory.write.assert_not_called()
+        records = self.client.get("/api/data/resources?source=inbound", headers=HEADERS).json()["resources"]
+        self.assertEqual([(row["resource_key"], row["status"]) for row in records], [("ada", "waiting_for_ldap")])
+        detail = self.client.get("/api/data/resource?source=inbound&key=ada", headers=HEADERS).json()["data"]
+        self.assertEqual((detail["givenName"], detail["familyName"]), ("Ada", "King"))
+        summary = self.client.get("/api/status", headers=HEADERS).json()["database"]
+        self.assertEqual(summary["pending_users"], {"pending": 1})
+        self.client.app.state.store.replace_resources("ldap", "Users", {"Grace": ADA})
         response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
-                                   json={"userName": "ada", "name": {"familyName": "Lovelace"}})
+                                    json={"userName": "grace", "name": {"familyName": "Hopper"}})
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.headers[ERROR_HEADER], "dry_run")
+        self.assertEqual(response.headers[ERROR_HEADER], "uniqueness")
+        self.assertIsNone(self.client.app.state.store.pending_user("grace"))
+
+    def test_inbound_create_is_queued_when_ldap_write_fails_and_retried(self):
+        self.client.put("/api/settings", headers=HEADERS, json={
+            "dry_run": False, "ldap_url": "ldaps://directory.example.org", "ldap_bind_dn": "cn=bridge",
+            "ldap_password": "saved-password", "ldap_base_dn": "dc=example,dc=org"})
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {}
+            directory.write.side_effect = ConnectionError("synthetic")
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                        json={"userName": "ada", "name": {"familyName": "Lovelace"}})
+        self.assertEqual(response.status_code, 201)
+        record = self.client.get("/api/data/resources", headers=HEADERS).json()["resources"][0]
+        self.assertEqual((record["source"], record["status"], record["error"], record["attempts"]),
+                         ("inbound", "waiting_for_ldap", "ConnectionError", 1))
+        with patch("bridge.service.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.side_effect = [{}, {"ada": ADA}]
+            self.assertEqual(self.client.app.state.service.drain_pending(), 1)
+            self.assertEqual(directory.write.call_args.args[0]["familyName"], "Lovelace")
+        self.assertEqual(self.client.app.state.store.pending_users(None), {})
+        records = self.client.get("/api/data/resources", headers=HEADERS).json()["resources"]
+        self.assertEqual([(row["source"], row["resource_key"], row["status"]) for row in records],
+                         [("ldap", "ada", "present")])
+        self.assertFalse(self.client.app.state.service.lock.locked())
+
+    def test_live_inbound_create_does_not_leave_queued_user(self):
+        self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False})
+        with patch("bridge.app.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.side_effect = [{}, {"ada": ADA}]
+            response = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                        json={"userName": "ada", "name": {"familyName": "Lovelace"}})
+        self.assertEqual(response.status_code, 201)
+        directory.write.assert_called_once()
+        self.assertEqual(self.client.app.state.store.pending_users(None), {})
+        self.assertIsNotNone(self.client.app.state.store.resource("ldap", "Users", "ada"))
+
+    def test_queued_user_existing_in_ldap_becomes_conflict_and_can_be_discarded(self):
+        store = self.client.app.state.store
+        self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                         json={"userName": "ada", "name": {"familyName": "Lovelace"}})
+        store.save_settings(store.settings().model_copy(update={
+            "dry_run": False, "ldap_url": "ldaps://directory.example.org", "ldap_bind_dn": "cn=bridge",
+            "ldap_password": "saved-password", "ldap_base_dn": "dc=example,dc=org"}))
+        with patch("bridge.service.LdapClient") as connector:
+            directory = connector.return_value.__enter__.return_value
+            directory.users.return_value = {"Ada": ADA}
+            self.assertEqual(self.client.app.state.service.drain_pending(), 0)
+            directory.write.assert_not_called()
+        record = self.client.get("/api/data/resources?source=inbound", headers=HEADERS).json()["resources"][0]
+        self.assertEqual(record["status"], "conflict")
+        self.assertEqual(self.client.delete("/api/data/pending?key=ada").status_code, 401)
+        self.assertEqual(self.client.delete("/api/data/pending?key=ada", headers=HEADERS).status_code, 200)
+        self.assertEqual(self.client.delete("/api/data/pending?key=ada", headers=HEADERS).status_code, 404)
+        self.assertEqual(store.pending_users(None), {})
 
     def test_duplicate_username_has_distinct_diagnostic(self):
         self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False})
@@ -284,25 +375,27 @@ class ApiTests(unittest.TestCase):
 
     def test_busy_read_and_write_preserve_lock_and_never_touch_ldap(self):
         service = self.client.app.state.service
+        self.assertEqual(self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False}).status_code, 200)
         service.lock.acquire()
         try:
             with patch("bridge.app.LdapClient") as connector:
-                responses = [
-                    self.client.get("/scim/v2/Users", headers=SCIM_HEADERS),
-                    self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
-                                     json={"userName": "ada", "name": {"familyName": "Lovelace"}}),
-                ]
+                response = self.client.get("/scim/v2/Users", headers=SCIM_HEADERS)
+                created = self.client.post("/scim/v2/Users", headers=SCIM_HEADERS,
+                                           json={"userName": "ada", "name": {"familyName": "Lovelace"}})
                 connector.assert_not_called()
-            for response in responses:
-                self.assertEqual(response.status_code, 409)
-                self.assertEqual(response.headers[ERROR_HEADER], "directory_busy")
-                self.assertEqual(response.json()["status"], "409")
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.headers[ERROR_HEADER], "directory_busy")
+            self.assertEqual(response.json()["status"], "409")
+            self.assertEqual(created.status_code, 201)
+            self.assertIn("ada", self.client.app.state.store.pending_users())
             self.assertTrue(service.lock.locked())
         finally:
             service.lock.release()
         with patch("bridge.app.LdapClient") as connector:
             connector.return_value.__enter__.return_value.users.return_value = {}
-            self.assertEqual(self.client.get("/scim/v2/Users", headers=SCIM_HEADERS).status_code, 200)
+            listed = self.client.get("/scim/v2/Users", headers=SCIM_HEADERS)
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual([user["userName"] for user in listed.json()["Resources"]], ["ada"])
 
     def test_scim_create_and_patch(self):
         self.client.put("/api/settings", headers=HEADERS, json={"dry_run": False})

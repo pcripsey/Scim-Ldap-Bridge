@@ -93,17 +93,21 @@ export interface Status {
     engine: string;
     inventory: { source: string; resource_type: string; count: number }[];
     operations: Record<string, number>;
+    pending_users?: Record<string, number>;
   };
   runs: Run[];
   events: Event[];
 }
 
 export interface Resource {
-  source: 'scim' | 'ldap';
+  source: 'scim' | 'ldap' | 'inbound';
   resource_type: string;
   resource_key: string;
   observed_at: string;
   present: number;
+  status?: 'present' | 'absent' | 'waiting_for_ldap' | 'conflict';
+  error?: string | null;
+  attempts?: number | null;
 }
 
 export interface Operation {

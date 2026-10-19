@@ -92,6 +92,24 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.snapshots(), {})
         self.assertEqual(self.store.resource_records(), [])
 
+    def test_pending_users_are_encrypted_unique_and_survive_restart_and_reset(self):
+        user = {"userName": "Ada", "familyName": "private-surname", "_raw": {"password": "never-stored"}}
+        self.assertTrue(self.store.add_pending(user))
+        self.assertFalse(self.store.add_pending({"userName": "ada", "familyName": "Other"}))
+        self.store.save_settings(Settings(), reset=True)
+        self.reopen()
+        self.assertEqual(self.store.pending_user("ADA"), {"userName": "Ada", "familyName": "private-surname", "_raw": {}})
+        raw = self.store.db.execute("SELECT data FROM pending_users").fetchone()[0]
+        self.assertNotIn(b"private-surname", raw)
+        self.store.pending_attempt("Ada", "ConnectionError")
+        record = self.store.resource_records()[0]
+        self.assertEqual((record["source"], record["status"], record["attempts"], record["error"]),
+                         ("inbound", "waiting_for_ldap", 1, "ConnectionError"))
+        self.assertEqual(self.store.resource_records(source="ldap"), [])
+        self.assertEqual(self.store.data_summary()["pending_users"], {"pending": 1})
+        self.assertTrue(self.store.remove_pending("ada"))
+        self.assertEqual(self.store.pending_users(None), {})
+
     def test_legacy_plaintext_baselines_are_migrated(self):
         self.store.close()
         with sqlite3.connect(Path(self.directory.name) / "bridge.db") as connection:

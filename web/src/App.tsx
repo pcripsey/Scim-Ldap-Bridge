@@ -1,7 +1,7 @@
 import { cloneElement, useCallback, useEffect, useId, useRef, useState, type FormEvent, type ReactElement, type ReactNode } from 'react';
 import {
   Activity, ArrowDownUp, ArrowRight, Check, ChevronLeft, ChevronRight, CircleHelp,
-  Database, ExternalLink, LayoutDashboard, LoaderCircle, LogOut, Network,
+  Database, ExternalLink, GitCompareArrows, LayoutDashboard, LoaderCircle, LogOut, Network,
   Play, RefreshCw, Save, Server, Settings2, ShieldCheck, X,
 } from 'lucide-react';
 import {
@@ -10,10 +10,11 @@ import {
   type Secrets, type Settings, type Status,
 } from './api';
 
-type Page = 'Overview' | 'Connections' | 'Synchronization' | 'Inventory' | 'Activity' | 'System';
+type Page = 'Overview' | 'Connections' | 'Attribute mapping' | 'Synchronization' | 'Inventory' | 'Activity' | 'System';
 const navigation = [
   { name: 'Overview', icon: LayoutDashboard, description: 'Your identity infrastructure, at a glance.' },
   { name: 'Connections', icon: Network, description: 'Connect your SCIM provider and LDAP directory.' },
+  { name: 'Attribute mapping', icon: GitCompareArrows, description: 'Map SCIM paths to LDAP attributes for your directory service.' },
   { name: 'Synchronization', icon: ArrowDownUp, description: 'Decide how identities move between your systems.' },
   { name: 'Inventory', icon: Database, description: 'Explore the last observed state of your directory resources.' },
   { name: 'Activity', icon: Activity, description: 'Follow synchronization runs, operations, and events.' },
@@ -38,6 +39,7 @@ function validEntraFilter(value: string) {
 }
 const date = (value: string | number | null) =>
   value === null ? 'Not scheduled' : new Date(typeof value === 'number' ? value * 1000 : value).toLocaleString();
+const settingsPages: Page[] = ['Connections', 'Attribute mapping', 'Synchronization'];
 const direction = { bidirectional: 'Bidirectional', scim_to_ldap: 'SCIM to LDAP', ldap_to_scim: 'LDAP to SCIM' };
 
 function Badge({ children, tone = '' }: { children: ReactNode; tone?: string }) {
@@ -291,7 +293,9 @@ function Console({ session, onLogout }: {
     const scopeChanged = (['scim_provider', 'entra_tenant_id', 'entra_client_id', 'scim_filter'] as const)
       .some(key => draft[key] !== saved[key]);
     if (!draft.dry_run && (saved.dry_run || (!saved.enabled && draft.enabled))) {
-      warnings.push('Live mode allows writes to your directories, including inbound SCIM provisioning. Enabling the schedule will run automatically.');
+      warnings.push(`Live mode allows writes to your directories, including inbound SCIM provisioning. Enabling the schedule will run automatically.${
+        Object.values(status.database.pending_users ?? {}).reduce((sum, count) => sum + count, 0)
+          ? ' Users waiting to be synchronised to LDAP will be created automatically.' : ''}`);
     }
     if (scopeChanged || (['scim_url', 'ldap_url', 'ldap_base_dn', 'ldap_bind_dn', 'ldap_service'] as const).some(key => draft[key] !== saved[key])) {
       warnings.push('Changing source scope or connector identity clears cached inventory and identity baselines. Confirm the provider, endpoint, tenant, client, and source filter identify the intended source before continuing.');
@@ -379,14 +383,18 @@ function Console({ session, onLogout }: {
         <button className="primary" disabled={Boolean(busy) || status.running || !connected || dirty || Boolean(pollError)} onClick={sync}><Play size={16} />{status.running ? 'Sync in progress' : 'Run sync'}</button></div></div>
     {notice && <Notice kind={notice.kind} dismiss={() => setNotice(null)}>{notice.text}</Notice>}
     {pollError && <Notice>{pollError} Displayed data may be stale. Retrying automatically.</Notice>}
-    {dirty && page !== 'Connections' && page !== 'Synchronization' && <Notice kind="warning">You have unsaved configuration changes. Save or discard them in Connections or Synchronization before running a sync.</Notice>}
+    {dirty && !settingsPages.includes(page) && <Notice kind="warning">You have unsaved configuration changes. Save or discard them in Connections, Attribute mapping, or Synchronization before running a sync.</Notice>}
     {page === 'Overview' && <>
       <div className={`environment-banner ${status.dry_run ? '' : 'live'}`}><div className="banner-icon"><ShieldCheck size={24} /></div>
         <div><strong>{status.dry_run ? 'A safe place to get in sync.' : 'Your bridge is in live mode.'}</strong><p>{status.dry_run ? 'Dry-run mode is enabled. Runs preview changes without writing to your directories.' : 'Synchronization and inbound provisioning can write to your directory systems.'}</p></div>
         <button onClick={() => setPage('Synchronization')}>Review policy <ArrowRight size={16} /></button></div>
       <div className="metrics">
         <Metric label="SCIM USERS" value={status.database.inventory.filter(row => row.source === 'scim' && row.resource_type === 'Users').reduce((sum, row) => sum + row.count, 0)} icon={<Network />} note="Present in last inventory" />
-        <Metric label="LDAP USERS" value={status.database.inventory.filter(row => row.source === 'ldap' && row.resource_type === 'Users').reduce((sum, row) => sum + row.count, 0)} icon={<Database />} note="Present in last inventory" />
+        <Metric label="LDAP USERS" value={status.database.inventory.filter(row => row.source === 'ldap' && row.resource_type === 'Users').reduce((sum, row) => sum + row.count, 0)} icon={<Database />}
+          note={[
+            status.database.pending_users?.pending ? `${status.database.pending_users.pending} waiting to be synchronised to LDAP` : '',
+            status.database.pending_users?.conflict ? `${status.database.pending_users.conflict} queued in conflict` : '',
+          ].filter(Boolean).join(' / ') || 'Present in last inventory'} />
         <Metric label="LINKED IDENTITIES" value={status.linked_users} icon={<ArrowDownUp />} note="Matching identity baselines" />
         <Metric label="SYNC STATUS" value={status.running ? 'Running' : 'Idle'} icon={<Activity />} note={status.enabled ? `Next: ${date(status.next_run)}` : 'Automatic schedule paused'} />
       </div>
@@ -405,7 +413,7 @@ function Console({ session, onLogout }: {
       <Panel title="Recent synchronization runs" subtitle="A record of what changed, and what didn't" action={<button className="text-button" onClick={() => setPage('Activity')}>View activity <ArrowRight size={15} /></button>}><Runs runs={status.runs.slice(0, 5)} /></Panel>
       <Panel title="Latest events"><Events events={status.events.slice(0, 5)} /></Panel>
     </>}
-    {(page === 'Connections' || page === 'Synchronization') && <form onSubmit={save}>
+    {settingsPages.includes(page) && <form onSubmit={save}>
       <fieldset disabled={Boolean(busy) || status.running} className="settings-fields">
       {page === 'Connections' ? <>
         <Notice kind="info">Credentials are encrypted at rest. Leave a credential unchanged to keep its saved value. Changing an endpoint or LDAP identity resets inventory and baselines.</Notice>
@@ -414,7 +422,7 @@ function Console({ session, onLogout }: {
             <dt>Tenant URL</dt><dd><code>{window.location.origin}/scim/v2</code></dd>
             <dt>Secret token</dt><dd>BRIDGE_SCIM_TOKEN (set on the server; never displayed here)</dd></dl>
           <p className="body-copy">Use the externally reachable HTTPS URL, including any reverse-proxy prefix. In Entra, configure Enterprise applications → Provisioning → Automatic with this tenant URL and the inbound secret token. The administrator token and outbound connector credentials are not interchangeable.</p>
-          <p className="panel-footnote">Push uses the saved LDAP connection and attribute mappings below, independently of the outbound provider and schedule. Dry run blocks inbound writes. Configure BRIDGE_SCIM_TOKEN and disable dry run only when ready.</p>
+          <p className="panel-footnote">Push uses the saved LDAP connection and the mappings on the Attribute mapping page, independently of the outbound provider and schedule. Pushed users are stored in the bridge database until they are created in LDAP; they appear in Inventory as waiting to be synchronised to LDAP while dry run is on, LDAP is unavailable, or another operation is running, and are retried automatically. Configure BRIDGE_SCIM_TOKEN and disable dry run only when ready.</p>
         </Panel>
         <Panel title="Outbound source" subtitle="Optional remote connector for scheduled or manual reconciliation; not needed for inbound SCIM push.">
           <Field label="Provider and authentication"><select value={draft.scim_provider} onChange={event => {
@@ -434,7 +442,7 @@ function Console({ session, onLogout }: {
             <div className="test-row"><button type="button" disabled={dirty || !scimReady} onClick={() => test('scim')}><Network size={16} />{busy === 'test-scim' ? 'Testing...' : 'Test SCIM connection'}</button></div>
           </Panel>
           <Panel title="LDAP directory" subtitle="A certificate-verified directory connection" action={<span className="section-icon"><Database size={20} /></span>}>
-            <Field label="LDAP service" hint="Selecting a different service replaces custom mappings with matching defaults and resets to dry run.">
+            <Field label="LDAP service" hint="Selecting a different service replaces custom attribute mappings with matching defaults and resets to dry run.">
               <select value={draft.ldap_service} onChange={event => {
                 const service = event.target.value as Settings['ldap_service'];
                 if (service in ldapServices) selectLdapService(service);
@@ -455,7 +463,14 @@ function Console({ session, onLogout }: {
             <div className="test-row"><button type="button" disabled={dirty || !saved.ldap_url || !saved.ldap_bind_dn || !saved.ldap_base_dn || !saved.ldap_password_configured} onClick={() => test('ldap')}><Database size={16} />{busy === 'test-ldap' ? 'Testing...' : 'Test LDAP connection'}</button></div>
           </Panel>
         </div>
-        <Panel title="Attribute mapping" subtitle="Map SCIM paths to LDAP attributes. Discovery uses saved, read-only connections.">
+        <Panel title="Password synchronization" subtitle="Not supported — attribute provisioning does not synchronize credentials.">
+          <p className="body-copy">The AD-only “Enable new AD accounts” option initializes a fresh, undisclosed random password for new accounts. It does not synchronize a source password or change existing accounts.</p>
+          <Notice kind="info">SCIM passwords are write-only and cannot be read back for reconciliation. Entra OAuth pull cannot retrieve existing user passwords, and Entra application provisioning is not a password-sync channel. There is no safe password-sync switch for these connectors.</Notice>
+          <p className="body-copy">For AD DS → Entra password hash synchronization, use Microsoft Entra Connect Sync or Cloud Sync where supported. That is not Entra → LDAP password export. For LDAP users, use the directory’s native password reset or a dedicated, separately secured password-change integration. The LDAP bind password above authenticates the bridge service account only.</p>
+          <p className="panel-footnote">Password mappings remain blocked. Inbound password fields are rejected by default, or dropped when “Ignore unsupported or unmapped fields” is enabled; dropping a field never changes a password.</p>
+        </Panel>
+      </> : page === 'Attribute mapping' ? <>
+        <Panel title="SCIM to LDAP attribute mappings" subtitle="Map SCIM paths to LDAP attributes. Discovery uses saved, read-only connections." action={<button type="button" className="text-button" onClick={() => setPage('Connections')}>LDAP service <ArrowRight size={15} /></button>}>
           <h3>Required attributes — {ldapServices[draft.ldap_service]}</h3>
           <dl className="details"><dt>{usernameAttribute || 'User identifier'}</dt><dd><Badge tone="amber">Required identity</Badge> Mapped from userName in both directions; must be unique.</dd>
             <dt>cn</dt><dd><Badge tone="amber">Required by schema</Badge> {activeDirectory ? 'Generated from userName for new account DNs.' : 'Generated from displayName, falling back to userName, unless explicitly mapped.'}</dd>
@@ -515,12 +530,6 @@ function Console({ session, onLogout }: {
             </div>)}
           </div>}
         </Panel>
-        <Panel title="Password synchronization" subtitle="Not supported — attribute provisioning does not synchronize credentials.">
-          <p className="body-copy">The AD-only “Enable new AD accounts” option initializes a fresh, undisclosed random password for new accounts. It does not synchronize a source password or change existing accounts.</p>
-          <Notice kind="info">SCIM passwords are write-only and cannot be read back for reconciliation. Entra OAuth pull cannot retrieve existing user passwords, and Entra application provisioning is not a password-sync channel. There is no safe password-sync switch for these connectors.</Notice>
-          <p className="body-copy">For AD DS → Entra password hash synchronization, use Microsoft Entra Connect Sync or Cloud Sync where supported. That is not Entra → LDAP password export. For LDAP users, use the directory’s native password reset or a dedicated, separately secured password-change integration. The LDAP bind password above authenticates the bridge service account only.</p>
-          <p className="panel-footnote">Password mappings remain blocked. Inbound password fields are rejected by default, or dropped when “Ignore unsupported or unmapped fields” is enabled; dropping a field never changes a password.</p>
-        </Panel>
       </> : <>
         <div className="two-columns"><Panel title="Reconciliation policy" subtitle="Choose the source of truth for your identities">
           <Field label="Synchronization direction"><select value={draft.direction} onChange={event => {
@@ -531,7 +540,7 @@ function Console({ session, onLogout }: {
             const value = event.target.value;
             if (value === 'manual' || value === 'scim_wins' || value === 'ldap_wins') update('conflict_policy', value);
           }}><option value="manual">Manual review (recommended)</option><option value="scim_wins">SCIM wins</option><option value="ldap_wins">LDAP wins</option></select></Field>
-          <label className="check-row"><input type="checkbox" aria-label="Dry-run mode" checked={draft.dry_run} onChange={event => update('dry_run', event.target.checked)} /><span><strong>Dry-run mode</strong><small>Preview planned changes. Blocks outbound and inbound writes.</small></span></label>
+          <label className="check-row"><input type="checkbox" aria-label="Dry-run mode" checked={draft.dry_run} onChange={event => update('dry_run', event.target.checked)} /><span><strong>Dry-run mode</strong><small>Preview planned changes. Blocks outbound and inbound directory writes; pushed SCIM users are stored and wait to be synchronised to LDAP.</small></span></label>
           {!draft.dry_run && <Notice kind="warning">Live mode permits writes to your directories. Review a dry run before turning this on.</Notice>}
         </Panel><Panel title="Automatic schedule" subtitle="Keep identities in sync without manual runs">
           <label className="check-row"><input type="checkbox" aria-label="Enable scheduled synchronization" checked={draft.enabled} onChange={event => update('enabled', event.target.checked)} /><span><strong>Enable scheduled synchronization</strong><small>Both connectors must be fully configured before enabling.</small></span></label>
@@ -542,7 +551,8 @@ function Console({ session, onLogout }: {
       </>}
       {saveBar}</fieldset>
     </form>}
-    {page === 'Inventory' && <Inventory api={api} report={text => setNotice({ text, kind: 'error' })} />}
+    {page === 'Inventory' && <Inventory api={api} report={text => setNotice({ text, kind: 'error' })}
+      notify={text => setNotice({ text, kind: 'success' })} />}
     {page === 'Activity' && <>
       <Panel title="Synchronization runs" subtitle="Most recent 30 runs. Operation history is retained for the latest 200."><Runs runs={status.runs} /></Panel>
       <Operations api={api} />
@@ -562,7 +572,15 @@ function Pager({ offset, count, busy, setOffset }: { offset: number; count: numb
   </div></div>;
 }
 
-function Inventory({ api, report }: DataProps) {
+const resourceStates: Record<NonNullable<Resource['status']>, { label: string; tone: string }> = {
+  present: { label: 'Present', tone: 'green' },
+  absent: { label: 'Absent', tone: 'amber' },
+  waiting_for_ldap: { label: 'Waiting to be synchronised to LDAP', tone: 'blue' },
+  conflict: { label: 'Conflict: exists in LDAP', tone: 'red' },
+};
+const sourceLabels: Record<Resource['source'], string> = { scim: 'SCIM', ldap: 'LDAP', inbound: 'SCIM push' };
+
+function Inventory({ api, report, notify }: DataProps & { notify: (text: string) => void }) {
   const [source, setSource] = useState('');
   const [resourceType, setResourceType] = useState('Users');
   const [filter, setFilter] = useState({ source: '', resourceType: 'Users' });
@@ -590,6 +608,17 @@ function Inventory({ api, report }: DataProps) {
 
   useEffect(() => { if (detail) dialog.current?.showModal(); }, [detail]);
 
+  async function discard(resource: Resource) {
+    if (!window.confirm(`Discard ${resource.resource_key}? It will not be created in LDAP.`)) return;
+    setInspecting(true);
+    try {
+      await api(`/api/data/pending?${new URLSearchParams({ key: resource.resource_key })}`, { method: 'DELETE' });
+      notify(`${resource.resource_key} was discarded from the LDAP queue.`);
+      setRevision(value => value + 1);
+    } catch (error) { report(message(error)); }
+    finally { setInspecting(false); }
+  }
+
   async function inspect(resource: Resource) {
     const id = ++inspection.current;
     setInspecting(true);
@@ -601,22 +630,27 @@ function Inventory({ api, report }: DataProps) {
     finally { if (id === inspection.current) setInspecting(false); }
   }
 
-  return <><Notice kind="info">Read-only inventory from the last complete connector read. Absent resources remain cached. Run synchronization to refresh it; editing cached data would not update your directories.</Notice>
+  return <><Notice kind="info">Read-only inventory from the last complete connector read. Absent resources remain cached. Run synchronization to refresh it; editing cached data would not update your directories. Users pushed through inbound SCIM are listed as SCIM push while they wait to be synchronised to LDAP, and are retried automatically when dry run is off.</Notice>
     <Panel title="Resource inventory" subtitle="Select a record to inspect its decrypted attributes" action={<button aria-label="Refresh inventory" onClick={() => setRevision(value => value + 1)} disabled={loading}><RefreshCw size={16} /></button>}>
       <form className="filters" onSubmit={event => { event.preventDefault(); setOffset(0); setFilter({ source, resourceType }); }}>
-        <Field label="Source"><select value={source} onChange={event => setSource(event.target.value)}><option value="">All sources</option><option value="scim">SCIM</option><option value="ldap">LDAP</option></select></Field>
+        <Field label="Source"><select value={source} onChange={event => setSource(event.target.value)}><option value="">All sources</option><option value="scim">SCIM</option><option value="ldap">LDAP</option><option value="inbound">SCIM push (waiting for LDAP)</option></select></Field>
         <Field label="Resource type"><input required maxLength={100} value={resourceType} onChange={event => setResourceType(event.target.value)} /></Field>
         <button type="submit">Apply filters</button>
       </form>
       {error ? <Notice>{error} Use refresh to retry.</Notice> : loading ? <Loading /> : rows.length ?
         <div className="table-scroll"><table><thead><tr><th>Resource key</th><th>Source</th><th>Type</th><th>State</th><th>Last observed</th><th>Details</th></tr></thead>
-          <tbody>{rows.map(row => <tr key={`${row.source}:${row.resource_type}:${row.resource_key}`}><td className="strong">{row.resource_key}</td><td><Badge>{row.source.toUpperCase()}</Badge></td><td>{row.resource_type}</td>
-            <td><Badge tone={row.present ? 'green' : 'amber'}>{row.present ? 'Present' : 'Absent'}</Badge></td><td>{date(row.observed_at)}</td>
-            <td><button className="text-button" disabled={inspecting} onClick={() => { void inspect(row); }}>Inspect <ExternalLink size={14} /></button></td></tr>)}</tbody></table></div>
+          <tbody>{rows.map(row => {
+            const status = row.status ?? (row.present ? 'present' : 'absent');
+            const state = resourceStates[status] ?? { label: status.replaceAll('_', ' '), tone: '' };
+            return <tr key={`${row.source}:${row.resource_type}:${row.resource_key}`}><td className="strong">{row.resource_key}</td><td><Badge>{sourceLabels[row.source] ?? row.source}</Badge></td><td>{row.resource_type}</td>
+              <td><Badge tone={state.tone}>{state.label}</Badge>{row.error && <small className="state-detail">Last attempt failed ({row.error}){row.attempts ? ` / ${row.attempts} attempt${row.attempts === 1 ? '' : 's'}` : ''}</small>}</td><td>{date(row.observed_at)}</td>
+              <td><div className="button-row"><button className="text-button" disabled={inspecting} onClick={() => { void inspect(row); }}>Inspect <ExternalLink size={14} /></button>
+                {row.source === 'inbound' && <button className="text-button" disabled={inspecting} onClick={() => { void discard(row); }}>Discard</button>}</div></td></tr>;
+          })}</tbody></table></div>
         : <Empty title="No resources found" text="Your inventory will appear after a successful sync. Check the filters if you expected records." />}
       <Pager offset={offset} count={rows.length} busy={loading || Boolean(error)} setOffset={setOffset} />
     </Panel>
-    {detail && <dialog ref={dialog} onClose={() => setDetail(null)} aria-labelledby="resource-title"><div className="dialog-heading"><div><h2 id="resource-title">{detail.resource.resource_key}</h2><p>{detail.resource.source.toUpperCase()} / {detail.resource.resource_type}</p></div><button aria-label="Close resource details" onClick={() => dialog.current?.close()}><X size={18} /></button></div>
+    {detail && <dialog ref={dialog} onClose={() => setDetail(null)} aria-labelledby="resource-title"><div className="dialog-heading"><div><h2 id="resource-title">{detail.resource.resource_key}</h2><p>{sourceLabels[detail.resource.source] ?? detail.resource.source} / {detail.resource.resource_type}</p></div><button aria-label="Close resource details" onClick={() => dialog.current?.close()}><X size={18} /></button></div>
       <p className="body-copy">Decrypted, cached attributes. Password attributes are excluded from storage.</p><pre>{JSON.stringify(detail.data, null, 2)}</pre></dialog>}
   </>;
 }

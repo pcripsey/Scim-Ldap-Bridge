@@ -95,6 +95,7 @@ dd { margin: 0; color: #45556e; text-align: right; overflow-wrap: anywhere; }
 .badge.blue { color: #4b80c6; background: #edf4fe; }
 .badge.amber { color: #b37c29; background: #fff5e4; }
 .badge.red { color: #bd5060; background: #fff0f1; }
+.state-detail { display: block; margin-top: 4px; color: #8794a8; font-size: 11px; }
 .table-scroll { width: 100%; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: left; }
 th { background: #fafbfd; color: #8b97a9; font-weight: 500; border-block: 1px solid #edf0f5; padding: 13px 18px; white-space: nowrap; }
