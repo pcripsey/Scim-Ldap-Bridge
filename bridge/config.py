@@ -1,8 +1,31 @@
+import json
 import re
 from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+ENTRA_SCIM_URL = "https://graph.microsoft.com/rp/scim"
+
+
+def validate_entra_filter(value):
+    if not value:
+        return value
+    match = re.fullmatch(r'(userName|id|externalId|groups\.value|active) eq (.+)|userName ew (.+)', value)
+    if match:
+        attribute, operand, suffix = match.groups()
+        if attribute == "active" and operand.lower() in {"true", "false"}:
+            return value
+        if attribute != "active":
+            try:
+                parsed = json.loads(operand if operand is not None else suffix)
+                if isinstance(parsed, str) and parsed and not any(ord(char) < 32 for char in parsed):
+                    return value
+            except (ValueError, TypeError):
+                pass
+    raise ValueError('Use one supported source predicate: userName/id/externalId/groups.value eq "value", '
+                     'userName ew "suffix", or active eq true/false.')
 
 
 class AttributeMapping(BaseModel):
@@ -44,11 +67,16 @@ DEFAULT_ATTRIBUTE_MAPPINGS = [
 
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    scim_provider: Literal["generic", "entra"] = "generic"
     scim_url: str = ""
-    scim_token: str = ""
+    scim_token: str = Field(default="", repr=False)
+    entra_tenant_id: str = ""
+    entra_client_id: str = ""
+    entra_client_secret: str = Field(default="", repr=False)
+    scim_filter: str = Field(default="", max_length=2048)
     ldap_url: str = ""
     ldap_bind_dn: str = ""
-    ldap_password: str = ""
+    ldap_password: str = Field(default="", repr=False)
     ldap_base_dn: str = ""
     attribute_mappings: list[AttributeMapping] = Field(default_factory=lambda: [
         AttributeMapping.model_validate(item) for item in DEFAULT_ATTRIBUTE_MAPPINGS
@@ -60,6 +88,13 @@ class Settings(BaseModel):
     interval_seconds: int = Field(default=300, ge=30, le=86400)
     enabled: bool = False
     dry_run: bool = True
+
+    @property
+    def scim_configured(self):
+        if self.scim_provider == "entra":
+            return bool(self.scim_url and self.entra_tenant_id and self.entra_client_id
+                        and self.entra_client_secret)
+        return bool(self.scim_url and self.scim_token)
 
     @model_validator(mode="after")
     def validate_endpoints(self):
@@ -84,7 +119,18 @@ class Settings(BaseModel):
                 and not self.ldap_allow_insecure):
             raise ValueError("ldap:// endpoints require StartTLS, an ldaps:// endpoint, "
                              "or explicitly allowing unencrypted LDAP.")
-        if self.enabled and not all((self.scim_url, self.ldap_url, self.ldap_base_dn,
-                                     self.ldap_bind_dn, self.ldap_password, self.scim_token)):
+        if self.scim_provider == "entra":
+            if self.scim_url not in {ENTRA_SCIM_URL, ENTRA_SCIM_URL + "/"}:
+                raise ValueError("Entra requires https://graph.microsoft.com/rp/scim (public cloud).")
+            for value in (self.entra_tenant_id, self.entra_client_id):
+                if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+                    raise ValueError("Entra tenant and client IDs must be GUIDs.")
+            if self.direction != "scim_to_ldap":
+                raise ValueError("Entra OAuth mode is pull-only; select SCIM to LDAP.")
+            validate_entra_filter(self.scim_filter)
+        elif self.scim_filter:
+            raise ValueError("Source filtering is only supported in Entra mode.")
+        if self.enabled and not all((self.scim_configured, self.ldap_url, self.ldap_base_dn,
+                                     self.ldap_bind_dn, self.ldap_password)):
             raise ValueError("Configure both connectors before enabling the schedule.")
         return self

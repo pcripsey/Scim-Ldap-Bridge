@@ -43,7 +43,8 @@ class TrafficHttpClient(httpx.Client):
             path = request.url.raw_path.split(b"?", 1)[0]
             prefix = self.base_url.raw_path.split(b"?", 1)[0].rstrip(b"/") + b"/"
             relative = path[len(prefix):] if path.startswith(prefix) else b""
-            route = ("/" + relative.decode("ascii") if relative in {b"Users", b"Schemas", b"ResourceTypes"}
+            route = ("/" + relative.decode("ascii") if relative in {
+                b"Users", b"Schemas", b"ResourceTypes", b"users", b"schemas", b"resourcetypes"}
                      else "/Users/{id}" if relative.startswith(b"Users/") and relative[6:]
                      and b"/" not in relative[6:] else "/<redacted>")
             method = request.method if request.method in {
@@ -209,6 +210,12 @@ def scim_document(user, existing=None, mappings=None):
 
 class ScimClient:
     def __init__(self, settings):
+        self.entra = None
+        if settings.scim_provider == "entra":
+            from bridge.entra import EntraScimClient
+
+            self.entra = EntraScimClient(settings)
+            return
         if not settings.scim_url or not settings.scim_token:
             raise ValueError("SCIM endpoint and bearer token are required.")
         check_scim_target(settings.scim_url)
@@ -223,9 +230,14 @@ class ScimClient:
         return self
 
     def __exit__(self, *args):
-        self.client.close()
+        if self.entra:
+            self.entra.close()
+        else:
+            self.client.close()
 
     def users(self):
+        if self.entra:
+            return self.entra.users()
         users = []
         start = 1
         while True:
@@ -251,6 +263,8 @@ class ScimClient:
         return index_users(users)
 
     def discovery(self):
+        if self.entra:
+            return self.entra.discovery()
         response = self.client.get("Schemas")
         response.raise_for_status()
         schemas = response.json().get("Resources", [])
@@ -273,6 +287,8 @@ class ScimClient:
         ], "users": page.get("totalResults", len(resources))}
 
     def write(self, user, existing=None):
+        if self.entra:
+            return self.entra.write(user, existing)
         document = scim_document(user, existing.get("_raw") if existing else None,
                                  self.settings.attribute_mappings)
         if existing:

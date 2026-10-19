@@ -13,7 +13,7 @@ from bridge.config import Settings
 SECRET_ATTRIBUTES = {
     "password", "userpassword", "unicodepwd", "authpassword", "dbcspwd",
     "supplementalcredentials", "ntpwdhistory", "lmpwdhistory", "krbprincipalkey",
-    "scim_token", "ldap_password",
+    "scim_token", "ldap_password", "entra_client_secret", "access_token", "refresh_token", "client_secret",
 }
 
 

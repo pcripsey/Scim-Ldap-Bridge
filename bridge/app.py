@@ -144,7 +144,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     @app.get("/api/settings", dependencies=[Depends(admin)])
     def settings():
         current = app.state.store.settings().model_dump()
-        for key in ("scim_token", "ldap_password"):
+        for key in ("scim_token", "ldap_password", "entra_client_secret"):
             current[key + "_configured"] = bool(current.pop(key))
         return current
 
@@ -155,6 +155,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
             raise HTTPException(409, "Wait for the active directory operation to finish.")
         try:
             old = store.settings()
+            confirmation = payload.pop("confirm_scope_reset", False)
             try:
                 current = Settings.model_validate({**old.model_dump(), **payload})
             except ValidationError as error:
@@ -166,8 +167,13 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
                 raise HTTPException(400, SELF_TARGET_DETAIL) from None
             except ValueError:
                 raise HTTPException(400, "Invalid SCIM endpoint or BRIDGE_SCIM_SELF_URLS configuration.") from None
-            reset = any(getattr(old, key) != getattr(current, key)
-                        for key in ("scim_url", "ldap_url", "ldap_base_dn", "ldap_bind_dn"))
+            scope_changed = any(getattr(old, key) != getattr(current, key)
+                                for key in ("scim_provider", "entra_tenant_id", "entra_client_id", "scim_filter"))
+            if scope_changed and confirmation is not True:
+                raise HTTPException(400, "Source identity/scope changes reset inventory and baselines. "
+                                    "Review the scope and confirm with confirm_scope_reset=true.")
+            reset = scope_changed or any(getattr(old, key) != getattr(current, key)
+                                        for key in ("scim_url", "ldap_url", "ldap_base_dn", "ldap_bind_dn"))
             store.save_settings(current, reset=reset)
             service.revision += 1
             store.event("info", "Configuration saved." + (" Identity baselines reset." if reset else ""))
@@ -178,7 +184,7 @@ def create_app(data_dir=None, admin_token=None, scim_token=None):
     @app.post("/api/sync", status_code=202, dependencies=[Depends(admin)])
     def sync():
         current = app.state.store.settings()
-        if not all((current.scim_url, current.scim_token, current.ldap_url, current.ldap_bind_dn,
+        if not all((current.scim_configured, current.ldap_url, current.ldap_bind_dn,
                     current.ldap_password, current.ldap_base_dn)):
             raise HTTPException(400, "Configure both connectors before starting a run.")
         try:
