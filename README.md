@@ -373,10 +373,11 @@ polling does not add per-request SQLite records.
 | `BRIDGE_LOG_POLLS` | `false` | Successful `/healthz` and `/api/status` requests log at `DEBUG`; `true` promotes them to `INFO` |
 
 Failures are not demoted as successful polls. Change these deployment variables
-and recreate the container (`docker compose up -d`) to apply them. `DEBUG` does
-**not** enable payload logging.
+and recreate the container (`docker compose up -d`) to apply them. Set
+`BRIDGE_LOG_LEVEL=DEBUG` to enable **redacted attribute/payload logging**.
+`INFO`, `WARNING`, and `ERROR` remain metadata-only; `OFF` emits nothing.
 
-Entries include `timestamp`, `level`, `direction`, `protocol`, `operation`,
+Metadata entries include `timestamp`, `level`, `direction`, `protocol`, `operation`,
 `result`, `duration_ms`, and `request_id`, plus safe operation-specific metadata:
 
 - Inbound HTTP requests receive a generated ID returned as `X-Request-ID`;
@@ -393,14 +394,51 @@ Entries include `timestamp`, `level`, `direction`, `protocol`, `operation`,
   aggregate result count where applicable. Connection, StartTLS, and bind are
   one `connect_starttls_bind` event (or `connect_bind`), covering ldap3's
   `auto_bind` lifecycle. Search logging also covers failures during lazy result
-  consumption. DNs and filters are not logged.
+  consumption. DNs and filters are only included in the separate DEBUG events.
 - Background work has its own generated request ID. A manually triggered job
   also has `parent_id` linking it to the initiating request.
 
-No request/response bodies, directory attributes, credentials, cookies, or
-authorization headers are logged, even at `DEBUG`. Raw Uvicorn access logs and
-httpx/httpcore/ldap3 logging are disabled to prevent accidental disclosure;
-Uvicorn exception tracebacks are reduced to a safe exception class.
+At DEBUG, separate events contain a sanitized `data` object and the same
+`request_id` as the metadata events (background jobs retain their existing
+`parent_id` link on the job event):
+
+- `request_payload` / `response_payload`: inbound `/scim/v2/Users` resource
+  traffic and outbound SCIM Users/Groups traffic, including Entra resource reads.
+  Inbound JSON is observed **before validation**, including rejected `active`,
+  `groups`, or password fields and PATCH operations. Values retain JSON types,
+  nested extension attributes, arrays, booleans, and nulls.
+- SCIM responses include resources, error status, and known static bridge
+  validation details. Untrusted free-form error `detail`, `message`, and
+  `error_description` values are redacted rather than risking echoed credentials.
+- `search_request` / `search_entry`: LDAP base DN, filter, requested attributes,
+  and individual returned entry attributes.
+- `add_attributes` / `modify_attributes`: LDAP DN, exact attribute sets,
+  object classes for adds, and ldap3 modification codes for changes
+  (`2` means `MODIFY_REPLACE`).
+
+Management/settings API bodies and OAuth/token exchanges are never captured.
+Headers, bind credentials, and connection objects are never included.
+Shared recursive redaction replaces sensitive values with `<redacted>`,
+preserving attribute names. This includes case-insensitive password,
+`userPassword;binary`, `unicodePwd`, credential, token, secret, private/encryption
+key names, and SCIM extension equivalents. Sensitive PATCH paths redact their
+`value`; embedded PATCH path filters and URL/query-like values are suppressed.
+Binary data is omitted, dates use ISO format, and unknown objects are not
+converted with `repr`. Sanitization or logging failures discard the event.
+
+Capture is limited to 32 KiB per JSON body and serialized event, depth 8,
+50 items per container, 500 visited values, and 512 characters per string.
+LDAP searches log at most 50 entries plus a truncation event per search.
+Limits produce explicit `<truncated>` or `{"truncated":true}` indicators;
+oversized JSON is omitted entirely, not logged as an unsafe partial document.
+Malformed/non-JSON bodies produce only safe capture-state metadata.
+Unconsumed outbound HTTP streams are not read just for logging.
+
+**DEBUG logs contain personal directory data. Restrict log access and retention,
+use DEBUG only while troubleshooting, and disable it afterwards.** Redaction is
+not a reason to keep DEBUG enabled routinely. Raw Uvicorn access logs and
+httpx/httpcore/ldap3 logging remain disabled; Uvicorn exception tracebacks are
+reduced to a safe exception class.
 
 Illustrative sanitized entries (synthetic metadata):
 
@@ -411,6 +449,14 @@ Illustrative sanitized entries (synthetic metadata):
 ```
 
 The successful poll example requires `BRIDGE_LOG_POLLS=true` at `INFO`.
+
+Illustrative DEBUG events (fake directory data, abbreviated metadata):
+
+```json
+{"level":"DEBUG","direction":"inbound","protocol":"scim","operation":"request_payload","request_id":"11111111111141118111111111111111","data":{"userName":"ada@example.invalid","name":{"familyName":"Example"},"active":false,"password":"<redacted>"}}
+{"level":"DEBUG","direction":"inbound","protocol":"scim","operation":"response_payload","request_id":"11111111111141118111111111111111","status":400,"data":{"status":"400","detail":"Account status, passwords, and group provisioning are not supported by this mapping."}}
+{"level":"DEBUG","direction":"outbound","protocol":"ldap","operation":"modify_attributes","request_id":"22222222222242228222222222222222","data":{"dn":"uid=ada,ou=People,dc=example","changes":{"sn":[[2,["Example"]]],"userPassword":"<redacted>"}}}
+```
 
 ### Diagnosing Provisioning And Connector Failures
 

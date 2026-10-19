@@ -1,3 +1,5 @@
+"""Directory transports with metadata logs and redacted DEBUG attribute events."""
+
 import ssl
 import time
 from functools import wraps
@@ -9,8 +11,11 @@ from ldap3.utils.dn import escape_rdn
 
 from bridge.config import DEFAULT_ATTRIBUTE_MAPPINGS
 from bridge.planner import canonical
+from bridge.log_safety import MAX_ITEMS, sensitive_attribute
 from bridge.self_target import CALLER_HEADER, CALLER_ID, ERROR_HEADER, SelfTargetError, check_scim_target
-from bridge.traffic import destination, elapsed, emit, upstream_metadata
+from bridge.traffic import (
+    JsonCapture, debug_enabled, debug_event, destination, elapsed, emit, upstream_metadata,
+)
 
 
 MAX_USERS = 10000
@@ -38,6 +43,31 @@ def _http_result(status):
 
 
 class TrafficHttpClient(httpx.Client):
+    def _payload(self, request, message, operation):
+        if not debug_enabled():
+            return
+        try:
+            # Only resource routes on this SCIM base; never OAuth/management URLs.
+            path = request.url.raw_path.split(b"?", 1)[0]
+            prefix = self.base_url.raw_path.split(b"?", 1)[0].rstrip(b"/") + b"/"
+            relative = path[len(prefix):] if path.startswith(prefix) else b""
+            if (request.url.scheme != self.base_url.scheme
+                    or request.url.host != self.base_url.host
+                    or request.url.port != self.base_url.port
+                    or not relative
+                    or relative.count(b"/") > 1
+                    or relative.split(b"/", 1)[0].lower() not in {b"users", b"groups"}):
+                return
+            capture = JsonCapture(message.headers.get("content-type", ""))
+            try:
+                capture.add(message.content)
+                data = capture.data()
+            except (httpx.RequestNotRead, httpx.ResponseNotRead):
+                data = {"capture": "stream_not_read"}
+            debug_event("outbound", "scim", operation, data)
+        except Exception:
+            pass
+
     def _record(self, request, started, response=None, error=None):
         try:
             path = request.url.raw_path.split(b"?", 1)[0]
@@ -65,12 +95,14 @@ class TrafficHttpClient(httpx.Client):
     def send(self, request, *args, **kwargs):
         request.headers[CALLER_HEADER] = CALLER_ID
         started = time.perf_counter()
+        self._payload(request, request, "request_payload")
         try:
             response = super().send(request, *args, **kwargs)
         except Exception as error:
             self._record(request, started, error=error)
             raise
         self._record(request, started, response=response)
+        self._payload(request, response, "response_payload")
         if response.headers.get(ERROR_HEADER) == "self_target":
             response.close()
             raise SelfTargetError()
@@ -394,6 +426,7 @@ class LdapClient:
     @_ldap_operation("search")
     def users(self):
         users = []
+        self._search_payload()
         entries = self.connection.extend.standard.paged_search(
             self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
             paged_size=200, generator=True)
@@ -401,6 +434,7 @@ class LdapClient:
             if entry["type"] != "searchResEntry":
                 continue
             self._traffic_entry_count += 1
+            self._entry_payload(entry)
             attrs = entry["attributes"]
             for name, value in attrs.items():
                 if not sensitive_attribute(name):
@@ -432,6 +466,7 @@ class LdapClient:
 
     @_ldap_operation("search")
     def discovery(self):
+        self._search_payload()
         entries = self.connection.extend.standard.paged_search(
             self.settings.ldap_base_dn, "(objectClass=inetOrgPerson)", attributes=ALL_ATTRIBUTES,
             paged_size=200, generator=True)
@@ -440,6 +475,7 @@ class LdapClient:
             if entry["type"] != "searchResEntry":
                 continue
             self._traffic_entry_count += 1
+            self._entry_payload(entry)
             count += 1
             for name, value in entry["attributes"].items():
                 if not sensitive_attribute(name):
@@ -483,17 +519,31 @@ class LdapClient:
 
     @_ldap_operation("modify")
     def _modify(self, *args):
+        if debug_enabled():
+            debug_event("outbound", "ldap", "modify_attributes",
+                        {"dn": args[0], "changes": args[1]})
         return self.connection.modify(*args)
 
     @_ldap_operation("add")
     def _add(self, *args):
+        if debug_enabled():
+            debug_event("outbound", "ldap", "add_attributes",
+                        {"dn": args[0], "object_classes": args[1], "attributes": args[2]})
         return self.connection.add(*args)
 
+    def _search_payload(self):
+        if debug_enabled():
+            debug_event("outbound", "ldap", "search_request",
+                        {"base_dn": self.settings.ldap_base_dn,
+                         "filter": "(objectClass=inetOrgPerson)", "attributes": ALL_ATTRIBUTES})
 
-def sensitive_attribute(name):
-    normalized = name.casefold().split(";")[0]
-    return any(term in normalized for term in (
-        "password", "pwd", "credential", "secret", "token", "privatekey", "krbprincipalkey"))
+    def _entry_payload(self, entry):
+        if debug_enabled():
+            if self._traffic_entry_count <= MAX_ITEMS:
+                debug_event("outbound", "ldap", "search_entry",
+                            {"dn": entry.get("dn"), "attributes": entry.get("attributes")})
+            elif self._traffic_entry_count == MAX_ITEMS + 1:
+                debug_event("outbound", "ldap", "search_entry", {"truncated": True})
 
 
 def collect_attribute_samples(value, samples, prefix=""):
