@@ -1,4 +1,7 @@
-"""Metadata-only traffic logging. Never pass payloads or exception messages here."""
+"""Metadata traffic logs plus bounded, redacted directory payloads at DEBUG only.
+
+emit() stays metadata-only. debug_event() is the sole attribute-value path.
+"""
 
 import json
 import logging
@@ -13,6 +16,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from bridge.self_target import ERROR_HEADER
+from bridge.log_safety import MAX_BYTES, sanitize
 
 
 correlation_id = ContextVar("traffic_correlation_id", default="")
@@ -119,6 +123,69 @@ def emit(direction, protocol, operation, result, duration_ms, **metadata):
         pass
 
 
+def debug_enabled():
+    return logger.isEnabledFor(logging.DEBUG)
+
+
+def debug_event(direction, protocol, operation, data, **metadata):
+    if not debug_enabled():
+        return
+    try:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "level": "DEBUG", "direction": direction, "protocol": protocol,
+            "operation": operation, "request_id": correlation_id.get() or new_id(),
+            "data": sanitize(data),
+        }
+        record.update(sanitize({k: v for k, v in metadata.items() if k in _fields}))
+        encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+        if len(encoded.encode("utf-8")) > MAX_BYTES:
+            record["data"] = {"capture": "output_limit", "truncated": True}
+            encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+        logger.log(logging.DEBUG, encoded)
+    except Exception:
+        # Fail closed: no raw data or exception fallback, including sink failures.
+        pass
+
+
+class JsonCapture:
+    """Observe bounded chunks without consuming, replacing, or replaying a stream."""
+
+    def __init__(self, content_type):
+        self.enabled = content_type.split(";", 1)[0].strip().lower() in {
+            "application/json", "application/scim+json",
+        }
+        self.body = bytearray()
+        self.truncated = False
+
+    def add(self, chunk):
+        if not self.enabled or self.truncated:
+            return
+        try:
+            if len(chunk) > MAX_BYTES - len(self.body):
+                self.truncated = True
+                self.body.clear()
+            else:
+                self.body.extend(chunk)
+        except Exception:
+            self.enabled = False
+            self.body.clear()
+
+    def data(self, complete=True):
+        if self.truncated:
+            return {"capture": "byte_limit", "truncated": True}
+        if not self.enabled:
+            return {"capture": "non_json"}
+        if not complete:
+            return {"capture": "incomplete"}
+        if not self.body:
+            return {"capture": "empty"}
+        try:
+            return json.loads(self.body)
+        except Exception:
+            return {"capture": "invalid_json"}
+
+
 class TrafficMiddleware:
     def __init__(self, app):
         self.app = app
@@ -133,9 +200,34 @@ class TrafficMiddleware:
         status = 500
         error = None
         reason = None
+        scim = debug_enabled() and bool(re.fullmatch(
+            r"/scim/v2/(?:Users|Groups)(?:/[^/]+)?/?", scope.get("path", "")))
+        request_capture = response_capture = None
+        request_complete = False
+        request_logged = False
+        if scim:
+            headers = dict(scope.get("headers", []))
+            request_capture = JsonCapture(headers.get(b"content-type", b"").decode("latin-1"))
+
+        def log_request():
+            nonlocal request_logged
+            if scim and not request_logged:
+                request_logged = True
+                debug_event("inbound", "scim", "request_payload",
+                            request_capture.data(request_complete))
+
+        async def request_receive():
+            nonlocal request_complete
+            message = await receive()
+            if scim and message["type"] == "http.request":
+                request_capture.add(message.get("body", b""))
+                request_complete = not message.get("more_body", False)
+                if request_complete:
+                    log_request()
+            return message
 
         async def response_send(message):
-            nonlocal status, reason
+            nonlocal status, reason, response_capture
             if message["type"] == "http.response.start":
                 status = message["status"]
                 message["headers"] = [
@@ -146,10 +238,19 @@ class TrafficMiddleware:
                     key.decode("latin-1"): value.decode("latin-1")
                     for key, value in message["headers"]
                 }).get("reason")
+                if scim:
+                    headers = dict(message.get("headers", []))
+                    response_capture = JsonCapture(headers.get(b"content-type", b"").decode("latin-1"))
+            if scim and message["type"] == "http.response.body" and response_capture is not None:
+                response_capture.add(message.get("body", b""))
+                if not message.get("more_body", False):
+                    log_request()
+                    debug_event("inbound", "scim", "response_payload",
+                                response_capture.data(), status=status)
             await send(message)
 
         try:
-            await self.app(scope, receive, response_send)
+            await self.app(scope, request_receive if scim else receive, response_send)
         except BaseException as exc:
             error = type(exc).__name__
             raise
